@@ -159,7 +159,8 @@ aiosmtpd.smtp
    For more information, please refer to the :ref:`auth` page.
 
 .. class:: SMTP(handler, *, data_size_limit=33554432, enable_SMTPUTF8=False, \
-   decode_data=False, hostname=None, ident=None, tls_context=None, \
+   decode_data=False, spool_threshold=None, hostname=None, ident=None, \
+   tls_context=None, \
    require_starttls=False, timeout=300, auth_required=False, \
    auth_require_tls=True, auth_exclude_mechanism=None, auth_callback=None, \
    authenticator=None, command_call_limit=None, \
@@ -197,6 +198,17 @@ aiosmtpd.smtp
       When ``True``, attempts to decode byte content in the ``DATA`` command,
       assigning the string value to the :ref:`envelope's <sessions_and_envelopes>`
       ``content`` attribute.
+
+   .. py:attribute:: spool_threshold
+      :type: Optional[int]
+      :value: None
+
+      When set to an ``int`` >= 0, enables :ref:`spool mode <spool_mode>`
+      for the ``DATA`` command: message content is buffered in memory only
+      up to this many bytes, beyond which it spills over to a temporary file
+      on disk.  Spool mode is active only if the handler implements the
+      ``handle_DATA_stream()`` hook (see :ref:`spool_mode`); otherwise a
+      warning is logged and the classic, fully in-memory behavior is kept.
 
    .. py:attribute:: hostname
       :type: Optional[str]
@@ -424,6 +436,10 @@ aiosmtpd.smtp
 
       The value of the *data_size_limit* argument passed into the constructor.
 
+   .. attribute:: spool_threshold
+
+      The value of the *spool_threshold* argument passed into the constructor.
+
    .. attribute:: enable_SMTPUTF8
 
       The value of the *enable_SMTPUTF8* argument passed into the constructor.
@@ -517,6 +533,91 @@ aiosmtpd.smtp
          Setting ``log_client_response=True`` might cause leakage of sensitive information!
 
          :boldital:`DO NOT TURN ON` UNLESS ABSOLUTELY NECESSARY!
+
+.. _spool_mode:
+
+Spooling DATA to temporary files
+================================
+
+By default, the entire content of a ``DATA`` command is accumulated in
+memory before it is handed to the handler.  For very large messages this can
+put unacceptable pressure on memory.  Setting the *spool_threshold* parameter
+of :class:`SMTP` to an ``int`` >= 0 enables **spool mode**, in which the
+message is streamed line by line into a
+:class:`tempfile.SpooledTemporaryFile`: content up to *spool_threshold*
+bytes stays in memory, and only the overflow is written to a temporary file
+on disk.  Small messages therefore never touch the disk, while the memory
+footprint of large messages is bounded by roughly
+``spool_threshold + line_length_limit`` bytes, because the server writes
+the message to the spool in per-line chunks as they arrive.
+
+Spool mode is active only when *spool_threshold* is set **and** the handler
+implements the ``handle_DATA_stream()`` hook.  If *spool_threshold* is set
+but the handler does not implement the hook, a warning is logged and the
+classic, fully in-memory behavior is kept; the server never falls back to
+reading the whole spool back into a single ``bytes`` object for the sake of
+compatibility.
+
+All classic ``DATA`` rules are enforced unchanged in spool mode: the line
+length limit (:attr:`SMTP.line_length_limit`), the total size limit
+(*data_size_limit*), dot-transparency, and the ``<CRLF>.<CRLF>``
+terminator.
+
+**Content semantics.**  The stream passed to ``handle_DATA_stream()``
+yields exactly the bytes that the classic path stores in
+``envelope.original_content``: the message as received, with CRLF line
+endings intact and dot-transparency removed as defined in
+:rfc:`RFC 5321, section 4.5.2 <5321#section-4.5.2>`.  The *decode_data*
+option has no effect in spool mode -- ``envelope.content`` and
+``envelope.original_content`` remain ``None`` -- because decoding the
+whole message would defeat the purpose of spooling; handlers that need a
+decoded view decode the bytes they read from the stream themselves.
+
+**Lifetime and cleanup.**  The temporary file belongs to the SMTP transaction
+that created it; it is unlinked as soon as the stream is closed.  The server
+closes the stream deterministically:
+
+* after the ``handle_DATA_stream()`` hook returns or raises, unless the
+  hook explicitly took ownership (see below);
+* when the client disconnects before sending the ``DATA`` terminator;
+* when the transaction is aborted by a line-length or size violation, or by
+  an ``OSError`` while writing to the temporary file (e.g. a full disk),
+  in which case the remaining data is drained and the client receives a
+  ``451`` reply;
+* a subsequent ``RSET`` always starts from a clean transaction state, with
+  no temporary file left over from previous transactions.
+
+A handler that needs to keep the message beyond the lifetime of the hook must
+explicitly transfer ownership by calling :meth:`MessageStream.take_ownership`;
+it then becomes responsible for closing the stream itself.
+
+.. class:: MessageStream
+
+   A seekable source of raw message bytes, passed as the *stream* argument to
+   the ``handle_DATA_stream()`` hook.  It wraps a
+   ``tempfile.SpooledTemporaryFile`` and offers the familiar file methods
+   ``read()``, ``readline()``, ``seek()``, ``tell()``, and
+   ``close()``, plus:
+
+   .. py:attribute:: closed
+
+      True if the stream has been closed.
+
+   .. py:attribute:: rolled_to_disk
+
+      True if the content outgrew the in-memory buffer and spilled over to a
+      temporary file on disk.
+
+   .. py:attribute:: ownership_taken
+
+      True if the handler took ownership of the stream.
+
+   .. py:method:: take_ownership()
+
+      Explicitly transfer ownership of the stream from the SMTP transaction
+      to the handler.  After this call, the server will not close the stream;
+      the handler becomes responsible for closing it (which also deletes any
+      backing temporary file).
 
 .. _tls:
 

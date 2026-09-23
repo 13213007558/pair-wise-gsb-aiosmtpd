@@ -7,6 +7,15 @@
 1.4.7 (aiosmtpd-next)
 =====================
 
+Added
+-----
+
+* Optional spool mode for ``DATA``: when the ``SMTP`` class is
+  instantiated with ``spool_threshold``, message content is buffered in
+  memory only up to the threshold and then spilled to a temporary file, and
+  handlers implementing the new ``handle_DATA_stream()`` hook receive a
+  seekable ``MessageStream`` instead of the whole message in memory.
+
 Fixed/Improved
 --------------
 

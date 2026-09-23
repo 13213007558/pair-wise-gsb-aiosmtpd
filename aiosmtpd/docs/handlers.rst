@@ -98,6 +98,24 @@ The following hooks are currently supported (in alphabetical order):
    ``decode_data=False`` or ``decode_data=True``.
    See :attr:`Envelope.content` for more info.
 
+.. py:method:: handle_DATA_stream(server, session, envelope, stream) -> str
+   :async:
+
+   :param stream: The seekable source of raw message bytes
+   :type stream: :class:`aiosmtpd.smtp.MessageStream`
+   :return: Response message to be sent to the client
+
+   Called during ``DATA`` -- in lieu of :meth:`handle_DATA` -- when
+   :ref:`spool mode <spool_mode>` is active, i.e. the
+   :class:`~aiosmtpd.smtp.SMTP` class was instantiated with
+   ``spool_threshold`` set.  Instead of receiving the whole message through
+   the envelope, the handler reads it from *stream*, so the message is never
+   materialized in memory as a single ``bytes`` object.
+
+   The stream is closed -- and any backing temporary file deleted -- as soon
+   as this hook returns or raises, unless the hook explicitly keeps it by
+   calling :meth:`stream.take_ownership() <aiosmtpd.smtp.MessageStream.take_ownership>`.
+
 .. py:method:: handle_EHLO(server, session, envelope, hostname, responses) -> List[str]
    :async:
    :noindex:

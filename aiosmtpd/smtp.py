@@ -11,6 +11,7 @@ import logging
 import re
 import socket
 import ssl
+import tempfile
 from base64 import b64decode, b64encode
 from email._header_value_parser import get_addr_spec, get_angle_addr
 from email.errors import HeaderParseError
@@ -55,6 +56,7 @@ class _DataState(enum.Enum):
     NOMINAL = enum.auto()
     TOO_LONG = enum.auto()
     TOO_MUCH = enum.auto()
+    SPOOL_ERROR = enum.auto()
 
 
 AuthCallbackType = Callable[[str, bytes, bytes], bool]
@@ -206,6 +208,80 @@ class Envelope:
         self.rcpt_options: List[str] = []
 
 
+@public
+class MessageStream:
+    """
+    A seekable source of raw message bytes, passed to handlers implementing
+    the ``handle_DATA_stream()`` hook when spool mode is enabled (see the
+    ``spool_threshold`` parameter of :class:`SMTP`).
+
+    The stream yields exactly the bytes that the legacy (non-spool) path
+    stores in ``envelope.original_content``: the message as received, with
+    CRLF line endings intact and dot-transparency removed as defined in
+    RFC 5321 section 4.5.2.  The ``decode_data`` option has no effect in
+    spool mode; handlers that need a decoded view must decode the bytes
+    they read from the stream themselves.
+
+    The stream is owned by the SMTP transaction: it is closed -- and any
+    backing temporary file is deleted -- as soon as the
+    ``handle_DATA_stream`` hook returns or raises.  A handler that needs
+    to keep the data beyond the lifetime of the hook must explicitly call
+    :meth:`take_ownership`; it then becomes responsible for closing the
+    stream itself.
+    """
+
+    def __init__(self, fileobj: "tempfile.SpooledTemporaryFile[bytes]") -> None:
+        self._fileobj = fileobj
+        self._ownership_taken = False
+
+    def read(self, size: int = -1) -> bytes:
+        """Read up to ``size`` bytes (or everything, if ``size`` < 0)."""
+        return self._fileobj.read(size)
+
+    def readline(self, size: int = -1) -> bytes:
+        """Read one line (up to ``size`` bytes, if ``size`` >= 0)."""
+        return self._fileobj.readline(size)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        """Reposition the stream; see :meth:`io.IOBase.seek`."""
+        return self._fileobj.seek(offset, whence)
+
+    def tell(self) -> int:
+        """Return the current stream position."""
+        return self._fileobj.tell()
+
+    def close(self) -> None:
+        """Close the stream, deleting any backing temporary file."""
+        self._fileobj.close()
+
+    @property
+    def closed(self) -> bool:
+        """True if the stream has been closed."""
+        return self._fileobj.closed
+
+    @property
+    def rolled_to_disk(self) -> bool:
+        """
+        True if the content outgrew the in-memory buffer and spilled over
+        to a temporary file on disk.
+        """
+        return bool(getattr(self._fileobj, "_rolled", False))
+
+    @property
+    def ownership_taken(self) -> bool:
+        """True if the handler took ownership of the stream."""
+        return self._ownership_taken
+
+    def take_ownership(self) -> None:
+        """
+        Explicitly transfer ownership of the stream from the SMTP
+        transaction to the handler.  After this call, the server will not
+        close the stream; the handler becomes responsible for closing it
+        (which also deletes any backing temporary file).
+        """
+        self._ownership_taken = True
+
+
 # This is here to enable debugging output when the -E option is given to the
 # unit test suite.  In that case, this function is mocked to set the debug
 # level on the loop (as if PYTHONASYNCIODEBUG=1 were set).
@@ -320,6 +396,7 @@ class SMTP(asyncio.StreamReaderProtocol):
             data_size_limit: Optional[int] = DATA_SIZE_DEFAULT,
             enable_SMTPUTF8: bool = False,
             decode_data: bool = False,
+            spool_threshold: Optional[int] = None,
             hostname: Optional[str] = None,
             ident: Optional[str] = None,
             tls_context: Optional[ssl.SSLContext] = None,
@@ -345,6 +422,10 @@ class SMTP(asyncio.StreamReaderProtocol):
         self.data_size_limit = data_size_limit
         self.enable_SMTPUTF8 = enable_SMTPUTF8
         self._decode_data = decode_data
+        assert spool_threshold is None or isinstance(spool_threshold, int)
+        if spool_threshold is not None and spool_threshold < 0:
+            raise ValueError("spool_threshold must be >= 0")
+        self.spool_threshold = spool_threshold
         self.command_size_limits.clear()
         if hostname:
             self.hostname = hostname
@@ -418,6 +499,19 @@ class SMTP(asyncio.StreamReaderProtocol):
             for m in dir(handler)
             if m.startswith("handle_")
         }
+
+        # Spool mode is active only if explicitly requested AND the handler
+        # supports the streaming interface; otherwise the legacy, fully
+        # in-memory DATA path is kept.
+        self._spool_enabled = False
+        if spool_threshold is not None:
+            if "DATA_stream" in self._handle_hooks:
+                self._spool_enabled = True
+            else:
+                log.warning(
+                    "spool_threshold is set but the handler does not "
+                    "implement handle_DATA_stream(); spool mode is disabled"
+                )
 
         # When we've deprecated the 4-arg form of handle_EHLO,
         # we can -- and should -- remove this whole code block
@@ -1423,123 +1517,192 @@ class SMTP(asyncio.StreamReaderProtocol):
         await self.push('354 End data with <CR><LF>.<CR><LF>')
         data: List[bytearray] = []
 
-        num_bytes: int = 0
-        limit: Optional[int] = self.data_size_limit
-        line_fragments: List[bytes] = []
-        state: _DataState = _DataState.NOMINAL
-        while self.transport is not None:           # pragma: nobranch
-            # Since eof_received cancels this coroutine,
-            # readuntil() can never raise asyncio.IncompleteReadError.
-            try:
-                # https://datatracker.ietf.org/doc/html/rfc5321#section-2.3.8
-                line: bytes = await self._reader.readuntil(b'\r\n')
-                log.debug('DATA readline: %s', line)
-                assert line.endswith(b'\r\n')
-            except asyncio.CancelledError:
-                # The connection got reset during the DATA command.
-                log.info('Connection lost during DATA')
-                self._writer.close()
-                raise
-            except asyncio.LimitOverrunError as e:
-                # The line exceeds StreamReader's "stream limit".
-                # Delay SMTP Status Code sending until data receive is complete
-                # This seems to be implied in RFC 5321 § 4.2.5
-                if state == _DataState.NOMINAL:
-                    # Transition to TOO_LONG only if we haven't gone TOO_MUCH yet
-                    state = _DataState.TOO_LONG
-                # Discard data immediately to prevent memory pressure
-                data *= 0
-                # Drain the stream anyways
-                line = await self._reader.read(e.consumed)
-                assert not line.endswith(b'\r\n')
-            # A lone dot in a line signals the end of DATA.
-            if not line_fragments and line == b'.\r\n':
-                break
-            num_bytes += len(line)
-            if state == _DataState.NOMINAL and limit and num_bytes > limit:
-                # Delay SMTP Status Code sending until data receive is complete
-                # This seems to be implied in RFC 5321 § 4.2.5
-                state = _DataState.TOO_MUCH
-                # Discard data immediately to prevent memory pressure
-                data *= 0
-            line_fragments.append(line)
-            if line.endswith(b'\r\n'):
-                # Record data only if state is "NOMINAL"
-                if state == _DataState.NOMINAL:
-                    line = EMPTY_BARR.join(line_fragments)
-                    if len(line) > self.line_length_limit:
-                        # Theoretically we shouldn't reach this place. But it's always
-                        # good to practice DEFENSIVE coding.
-                        state = _DataState.TOO_LONG
-                        # Discard data immediately to prevent memory pressure
-                        data *= 0
-                    else:
-                        data.append(EMPTY_BARR.join(line_fragments))
-                line_fragments *= 0
+        spool: Optional["tempfile.SpooledTemporaryFile[bytes]"] = None
+        if self._spool_enabled:
+            assert self.spool_threshold is not None
+            spool = tempfile.SpooledTemporaryFile(max_size=self.spool_threshold)
+        try:
+            num_bytes: int = 0
+            limit: Optional[int] = self.data_size_limit
+            line_fragments: List[bytes] = []
+            state: _DataState = _DataState.NOMINAL
 
-        # Day of reckoning! Let's take care of those out-of-nominal situations
-        if state != _DataState.NOMINAL:
-            if state == _DataState.TOO_LONG:
-                await self.push("500 Line too long (see RFC5321 4.5.3.1.6)")
-            elif state == _DataState.TOO_MUCH:  # pragma: nobranch
-                await self.push('552 Error: Too much mail data')
-            self._set_post_data_state()
-            return
+            def discard_spool() -> None:
+                # Idempotently discard spooled data, releasing the temporary
+                # file (if any) as soon as it is no longer needed.
+                nonlocal spool
+                if spool is not None:
+                    spool.close()
+                    spool = None
 
-        # If unfinished_line is non-empty, then the connection was closed.
-        assert not line_fragments
-
-        # Remove extraneous carriage returns and de-transparency
-        # according to RFC 5321, Section 4.5.2.
-        for text in data:
-            if text.startswith(b'.'):
-                del text[0]
-        original_content: bytes = EMPTYBYTES.join(data)
-        # Discard data immediately to prevent memory pressure
-        data *= 0
-
-        content: Union[str, bytes]
-        if self._decode_data:
-            if self.enable_SMTPUTF8:
-                content = original_content.decode('utf-8', errors='surrogateescape')
-            else:
+            while self.transport is not None:           # pragma: nobranch
+                # Since eof_received cancels this coroutine,
+                # readuntil() can never raise asyncio.IncompleteReadError.
                 try:
-                    content = original_content.decode('ascii', errors='strict')
-                except UnicodeDecodeError:
-                    # This happens if enable_smtputf8 is false, meaning that
-                    # the server explicitly does not want to accept non-ascii,
-                    # but the client ignores that and sends non-ascii anyway.
-                    await self.push('500 Error: strict ASCII mode')
-                    return
-        else:
-            content = original_content
-        self.envelope.content = content
-        self.envelope.original_content = original_content
+                    # https://datatracker.ietf.org/doc/html/rfc5321#section-2.3.8
+                    line: bytes = await self._reader.readuntil(b'\r\n')
+                    log.debug('DATA readline: %s', line)
+                    assert line.endswith(b'\r\n')
+                except asyncio.CancelledError:
+                    # The connection got reset during the DATA command.
+                    log.info('Connection lost during DATA')
+                    self._writer.close()
+                    raise
+                except asyncio.LimitOverrunError as e:
+                    # The line exceeds StreamReader's "stream limit".
+                    # Delay SMTP Status Code sending until data receive is complete
+                    # This seems to be implied in RFC 5321 § 4.2.5
+                    if state == _DataState.NOMINAL:
+                        # Transition to TOO_LONG only if we haven't gone
+                        # TOO_MUCH yet
+                        state = _DataState.TOO_LONG
+                    # Discard data immediately to prevent memory pressure
+                    data *= 0
+                    discard_spool()
+                    # Drain the stream anyways
+                    line = await self._reader.read(e.consumed)
+                    assert not line.endswith(b'\r\n')
+                # A lone dot in a line signals the end of DATA.
+                if not line_fragments and line == b'.\r\n':
+                    break
+                num_bytes += len(line)
+                if state == _DataState.NOMINAL and limit and num_bytes > limit:
+                    # Delay SMTP Status Code sending until data receive is
+                    # complete. This seems to be implied in RFC 5321 § 4.2.5
+                    state = _DataState.TOO_MUCH
+                    # Discard data immediately to prevent memory pressure
+                    data *= 0
+                    discard_spool()
+                line_fragments.append(line)
+                if line.endswith(b'\r\n'):
+                    # Record data only if state is "NOMINAL"
+                    if state == _DataState.NOMINAL:
+                        line = EMPTY_BARR.join(line_fragments)
+                        if len(line) > self.line_length_limit:
+                            # Theoretically we shouldn't reach this place. But
+                            # it's always good to practice DEFENSIVE coding.
+                            state = _DataState.TOO_LONG
+                            # Discard data immediately to prevent memory pressure
+                            data *= 0
+                            discard_spool()
+                        elif spool is not None:
+                            # De-transparency according to RFC 5321 § 4.5.2,
+                            # then stream the line to the spool, which rolls
+                            # over to a temporary file once it grows beyond
+                            # spool_threshold bytes.
+                            if line.startswith(b'.'):
+                                del line[0]
+                            try:
+                                spool.write(line)
+                            except OSError:
+                                log.warning(
+                                    'Cannot spool DATA to temporary storage',
+                                    exc_info=True)
+                                state = _DataState.SPOOL_ERROR
+                                # Discard data immediately to prevent memory
+                                # pressure
+                                data *= 0
+                                discard_spool()
+                        else:
+                            data.append(EMPTY_BARR.join(line_fragments))
+                    line_fragments *= 0
 
-        # Call the new API first if it's implemented.
-        if "DATA" in self._handle_hooks:
-            status = await self._call_handler_hook('DATA')
-        else:
-            # Backward compatibility.
-            status = MISSING
-            if hasattr(self.event_handler, 'process_message'):
-                warn('Use handler.handle_DATA() instead of .process_message()',
-                     DeprecationWarning)
-                assert self.session is not None
-                args = (self.session.peer, self.envelope.mail_from,
-                        self.envelope.rcpt_tos, self.envelope.content)
-                if inspect.iscoroutinefunction(
-                        self.event_handler.process_message):
-                    status = await self.event_handler.process_message(*args)
+            # Day of reckoning! Let's take care of those out-of-nominal
+            # situations
+            if state != _DataState.NOMINAL:
+                if state == _DataState.TOO_LONG:
+                    await self.push("500 Line too long (see RFC5321 4.5.3.1.6)")
+                elif state == _DataState.TOO_MUCH:
+                    await self.push('552 Error: Too much mail data')
+                elif state == _DataState.SPOOL_ERROR:   # pragma: nobranch
+                    await self.push(
+                        '451 Requested action aborted: '
+                        'local error in processing')
+                self._set_post_data_state()
+                return
+
+            # If unfinished_line is non-empty, then the connection was closed.
+            assert not line_fragments
+
+            if spool is not None:
+                # Spool mode: hand the seekable stream over to the handler
+                # without ever reading the whole message back into memory.
+                spool.seek(0)
+                stream = MessageStream(spool)
+                # The stream wrapper now owns the spool file.
+                spool = None
+                try:
+                    status = await self._call_handler_hook(
+                        'DATA_stream', stream)
+                finally:
+                    if not stream.ownership_taken:
+                        stream.close()
+                self._set_post_data_state()
+                await self.push('250 OK' if status is MISSING else status)
+                return
+
+            # Remove extraneous carriage returns and de-transparency
+            # according to RFC 5321, Section 4.5.2.
+            for text in data:
+                if text.startswith(b'.'):
+                    del text[0]
+            original_content: bytes = EMPTYBYTES.join(data)
+            # Discard data immediately to prevent memory pressure
+            data *= 0
+
+            content: Union[str, bytes]
+            if self._decode_data:
+                if self.enable_SMTPUTF8:
+                    content = original_content.decode(
+                        'utf-8', errors='surrogateescape')
                 else:
-                    status = self.event_handler.process_message(*args)
-                # The deprecated API can return None which means, return the
-                # default status.  Don't worry about coverage for this case as
-                # it's a deprecated API that will go away after 1.0.
-                if status is None:                  # pragma: nocover
-                    status = MISSING
-        self._set_post_data_state()
-        await self.push('250 OK' if status is MISSING else status)
+                    try:
+                        content = original_content.decode(
+                            'ascii', errors='strict')
+                    except UnicodeDecodeError:
+                        # This happens if enable_smtputf8 is false, meaning
+                        # that the server explicitly does not want to accept
+                        # non-ascii, but the client ignores that and sends
+                        # non-ascii anyway.
+                        await self.push('500 Error: strict ASCII mode')
+                        return
+            else:
+                content = original_content
+            self.envelope.content = content
+            self.envelope.original_content = original_content
+
+            # Call the new API first if it's implemented.
+            if "DATA" in self._handle_hooks:
+                status = await self._call_handler_hook('DATA')
+            else:
+                # Backward compatibility.
+                status = MISSING
+                if hasattr(self.event_handler, 'process_message'):
+                    warn('Use handler.handle_DATA() instead of '
+                         '.process_message()',
+                         DeprecationWarning)
+                    assert self.session is not None
+                    args = (self.session.peer, self.envelope.mail_from,
+                            self.envelope.rcpt_tos, self.envelope.content)
+                    if inspect.iscoroutinefunction(
+                            self.event_handler.process_message):
+                        status = await self.event_handler.process_message(*args)
+                    else:
+                        status = self.event_handler.process_message(*args)
+                    # The deprecated API can return None which means, return
+                    # the default status.  Don't worry about coverage for
+                    # this case as it's a deprecated API that will go away
+                    # after 1.0.
+                    if status is None:                  # pragma: nocover
+                        status = MISSING
+            self._set_post_data_state()
+            await self.push('250 OK' if status is MISSING else status)
+        finally:
+            # Whatever happens -- success, handler exception, or the client
+            # disappearing mid-DATA -- the spool belongs to this transaction
+            # and must not leak.
+            if spool is not None:
+                spool.close()
 
     # Commands that have not been implemented.
     async def smtp_EXPN(self, arg: str):
