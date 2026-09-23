@@ -97,6 +97,11 @@ class ErrorSMTP(Server):
 # region #### Special-Purpose Handlers ################################################
 
 
+class ListStatusHandler:
+    async def handle_DATA(self, server, session, envelope):
+        return ["250 2.0.0 Delivered"] * len(envelope.rcpt_tos)
+
+
 # noinspection TimingAttack
 class PeekerHandler:
     sess: SMTPSession = None
@@ -461,6 +466,36 @@ class TestProtocol:
         assert responses[5] == S.S250_OK.to_bytes() + b"\r\n"
         assert len(handler.box) == 1
         assert handler.box[0].content == b""
+
+    def test_data_list_status_not_supported(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        # Per-recipient DATA statuses are an LMTP-only feature; under SMTP
+        # the transaction fails with a single, deterministic reply.
+        handler = ListStatusHandler()
+        protocol = get_protocol(handler)
+        protocol.data_received(
+            BCRLF.join(
+                [
+                    b"HELO example.org",
+                    b"MAIL FROM: <anne@example.com>",
+                    b"RCPT TO: <anne@example.com>",
+                    b"RCPT TO: <bart@example.com>",
+                    b"DATA",
+                    b".",
+                    b"QUIT\r\n",
+                ]
+            )
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        idx = responses.index(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+        assert responses[idx + 1] == (
+            b"500 Error: multiple DATA statuses not supported\r\n"
+        )
+        # Exactly one final DATA status was sent; the next reply is QUIT's.
+        assert responses[idx + 2] == b"221 Bye\r\n"
 
 
 @pytest.mark.usefixtures("plain_controller")

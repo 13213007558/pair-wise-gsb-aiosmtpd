@@ -80,10 +80,11 @@ The following hooks are currently supported (in alphabetical order):
 
    For more information, please read the documentation for :ref:`auth`.
 
-.. py:method:: handle_DATA(server, session, envelope) -> str
+.. py:method:: handle_DATA(server, session, envelope) -> Union[str, List[str]]
    :async:
 
-   :return: Response message to be sent to the client
+   :return: Response message to be sent to the client.
+      See below for the exact contract.
 
    Called during ``DATA`` after the entire message (`"SMTP content"
    <https://tools.ietf.org/html/rfc5321#section-2.3.9>`_ as described in
@@ -97,6 +98,26 @@ The following hooks are currently supported (in alphabetical order):
    the type depends on whether :class:`~aiosmtpd.smtp.SMTP` was instantiated with
    ``decode_data=False`` or ``decode_data=True``.
    See :attr:`Envelope.content` for more info.
+
+   The return value determines the final status (or statuses) of the
+   ``DATA`` command:
+
+   * A single status string (e.g. ``"250 OK"``) applies to the whole
+     transaction. Under :ref:`LMTP <LMTP>` it is reported for every
+     accepted recipient.
+   * Under :ref:`LMTP <LMTP>` only, a list of status strings may be
+     returned, corresponding one-to-one (and in order) to the accepted
+     recipients in ``envelope.rcpt_tos``. Each entry must be a valid
+     final reply, i.e. start with a ``2xx``, ``4xx``, or ``5xx`` code.
+     Recipients rejected during ``RCPT TO`` do not occupy a slot, while
+     an address accepted twice occupies two slots.
+
+   If the list does not match the accepted recipients exactly, or
+   contains an invalid status, the whole transaction is failed with a
+   ``451`` reply for every recipient *before* anything is sent, so the
+   client never sees a partial set of replies. Likewise, an exception
+   raised by the handler is converted into a ``500`` reply (per
+   recipient under LMTP).
 
 .. py:method:: handle_EHLO(server, session, envelope, hostname, responses) -> List[str]
    :async:

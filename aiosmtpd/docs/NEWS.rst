@@ -7,6 +7,14 @@
 1.4.7 (aiosmtpd-next)
 =====================
 
+Added
+-----
+
+* LMTP now sends one final DATA reply per accepted recipient, as
+  required by RFC 2033. The handle_DATA hook may return a list of
+  per-recipient statuses matching envelope.rcpt_tos; a single status
+  string still applies to all accepted recipients.
+
 Fixed/Improved
 --------------
 

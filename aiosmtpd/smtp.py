@@ -1420,6 +1420,10 @@ class SMTP(asyncio.StreamReaderProtocol):
             await self.push('501 Syntax: DATA')
             return
 
+        # Snapshot the accepted recipients before the envelope gets reset;
+        # subclasses (e.g. LMTP) need them to fan out per-recipient statuses.
+        rcpt_tos = list(self.envelope.rcpt_tos)
+
         await self.push('354 End data with <CR><LF>.<CR><LF>')
         data: List[bytearray] = []
 
@@ -1480,9 +1484,10 @@ class SMTP(asyncio.StreamReaderProtocol):
         # Day of reckoning! Let's take care of those out-of-nominal situations
         if state != _DataState.NOMINAL:
             if state == _DataState.TOO_LONG:
-                await self.push("500 Line too long (see RFC5321 4.5.3.1.6)")
+                status = "500 Line too long (see RFC5321 4.5.3.1.6)"
             elif state == _DataState.TOO_MUCH:  # pragma: nobranch
-                await self.push('552 Error: Too much mail data')
+                status = '552 Error: Too much mail data'
+            await self._push_data_status(status, rcpt_tos)
             self._set_post_data_state()
             return
 
@@ -1509,37 +1514,65 @@ class SMTP(asyncio.StreamReaderProtocol):
                     # This happens if enable_smtputf8 is false, meaning that
                     # the server explicitly does not want to accept non-ascii,
                     # but the client ignores that and sends non-ascii anyway.
-                    await self.push('500 Error: strict ASCII mode')
+                    await self._push_data_status(
+                        '500 Error: strict ASCII mode', rcpt_tos)
                     return
         else:
             content = original_content
         self.envelope.content = content
         self.envelope.original_content = original_content
 
-        # Call the new API first if it's implemented.
-        if "DATA" in self._handle_hooks:
-            status = await self._call_handler_hook('DATA')
-        else:
-            # Backward compatibility.
-            status = MISSING
-            if hasattr(self.event_handler, 'process_message'):
-                warn('Use handler.handle_DATA() instead of .process_message()',
-                     DeprecationWarning)
-                assert self.session is not None
-                args = (self.session.peer, self.envelope.mail_from,
-                        self.envelope.rcpt_tos, self.envelope.content)
-                if inspect.iscoroutinefunction(
-                        self.event_handler.process_message):
-                    status = await self.event_handler.process_message(*args)
-                else:
-                    status = self.event_handler.process_message(*args)
-                # The deprecated API can return None which means, return the
-                # default status.  Don't worry about coverage for this case as
-                # it's a deprecated API that will go away after 1.0.
-                if status is None:                  # pragma: nocover
-                    status = MISSING
+        status: Any
+        try:
+            # Call the new API first if it's implemented.
+            if "DATA" in self._handle_hooks:
+                status = await self._call_handler_hook('DATA')
+            else:
+                # Backward compatibility.
+                status = MISSING
+                if hasattr(self.event_handler, 'process_message'):
+                    warn('Use handler.handle_DATA() instead of .process_message()',
+                         DeprecationWarning)
+                    assert self.session is not None
+                    args = (self.session.peer, self.envelope.mail_from,
+                            self.envelope.rcpt_tos, self.envelope.content)
+                    if inspect.iscoroutinefunction(
+                            self.event_handler.process_message):
+                        status = await self.event_handler.process_message(*args)
+                    else:
+                        status = self.event_handler.process_message(*args)
+                    # The deprecated API can return None which means, return the
+                    # default status.  Don't worry about coverage for this case as
+                    # it's a deprecated API that will go away after 1.0.
+                    if status is None:              # pragma: nocover
+                        status = MISSING
+        except ConnectionResetError:
+            raise
+        except Exception as error:
+            # Convert handler exceptions into a definitive status so that
+            # subclasses can still emit a well-formed reply (or replies).
+            status = await self.handle_exception(error)
         self._set_post_data_state()
-        await self.push('250 OK' if status is MISSING else status)
+        await self._push_data_status(status, rcpt_tos)
+
+    async def _push_data_status(
+        self, status: Any, rcpt_tos: List[str]
+    ) -> None:
+        """Push the final DATA status to the client.
+
+        SMTP sends exactly one status line. A handler may alternatively
+        return a list of per-recipient statuses, but that is only
+        meaningful for LMTP (RFC 2033); under SMTP it is a contract
+        violation and the transaction is failed deterministically.
+        """
+        if status is MISSING:
+            status = '250 OK'
+        elif isinstance(status, (list, tuple)):
+            log.warning(
+                'Handler returned %d DATA statuses for a non-LMTP session',
+                len(status))
+            status = '500 Error: multiple DATA statuses not supported'
+        await self.push(status)
 
     # Commands that have not been implemented.
     async def smtp_EXPN(self, arg: str):
