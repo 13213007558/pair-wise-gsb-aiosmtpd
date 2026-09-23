@@ -1516,28 +1516,37 @@ class SMTP(asyncio.StreamReaderProtocol):
         self.envelope.content = content
         self.envelope.original_content = original_content
 
+        status = await self._get_data_status()
+        await self._finalize_data(status)
+
+    async def _get_data_status(self) -> Any:
+        """Invoke the DATA handler hooks and return the resulting status."""
         # Call the new API first if it's implemented.
         if "DATA" in self._handle_hooks:
-            status = await self._call_handler_hook('DATA')
-        else:
-            # Backward compatibility.
-            status = MISSING
-            if hasattr(self.event_handler, 'process_message'):
-                warn('Use handler.handle_DATA() instead of .process_message()',
-                     DeprecationWarning)
-                assert self.session is not None
-                args = (self.session.peer, self.envelope.mail_from,
-                        self.envelope.rcpt_tos, self.envelope.content)
-                if inspect.iscoroutinefunction(
-                        self.event_handler.process_message):
-                    status = await self.event_handler.process_message(*args)
-                else:
-                    status = self.event_handler.process_message(*args)
-                # The deprecated API can return None which means, return the
-                # default status.  Don't worry about coverage for this case as
-                # it's a deprecated API that will go away after 1.0.
-                if status is None:                  # pragma: nocover
-                    status = MISSING
+            return await self._call_handler_hook('DATA')
+        # Backward compatibility.
+        status = MISSING
+        if hasattr(self.event_handler, 'process_message'):
+            warn('Use handler.handle_DATA() instead of .process_message()',
+                 DeprecationWarning)
+            assert self.session is not None
+            assert self.envelope is not None
+            args = (self.session.peer, self.envelope.mail_from,
+                    self.envelope.rcpt_tos, self.envelope.content)
+            if inspect.iscoroutinefunction(
+                    self.event_handler.process_message):
+                status = await self.event_handler.process_message(*args)
+            else:
+                status = self.event_handler.process_message(*args)
+            # The deprecated API can return None which means, return the
+            # default status.  Don't worry about coverage for this case as
+            # it's a deprecated API that will go away after 1.0.
+            if status is None:                      # pragma: nocover
+                status = MISSING
+        return status
+
+    async def _finalize_data(self, status: Any) -> None:
+        """Reset the envelope and send the final DATA reply to the client."""
         self._set_post_data_state()
         await self.push('250 OK' if status is MISSING else status)
 

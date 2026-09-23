@@ -83,7 +83,10 @@ The following hooks are currently supported (in alphabetical order):
 .. py:method:: handle_DATA(server, session, envelope) -> str
    :async:
 
-   :return: Response message to be sent to the client
+   :return: Response message to be sent to the client.  When serving LMTP
+     (see :ref:`LMTP`), this may also be a list of response messages, one
+     per accepted recipient, in the same order as ``envelope.rcpt_tos``;
+     a single response message applies to all accepted recipients.
 
    Called during ``DATA`` after the entire message (`"SMTP content"
    <https://tools.ietf.org/html/rfc5321#section-2.3.9>`_ as described in
