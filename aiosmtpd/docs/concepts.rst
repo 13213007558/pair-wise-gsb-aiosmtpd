@@ -163,6 +163,56 @@ completed, or in certain error conditions as mandated by :rfc:`5321`.
       any recipient options provided by the client, such as those passed in by
       :meth:`smtplib.SMTP.sendmail`
 
+   .. attribute:: envid
+      :type: Optional[str]
+
+      Defaulting to None, this attribute holds the ``ENVID`` parameter of the
+      ``MAIL FROM`` command (:rfc:`3461`), already decoded from its
+      *xtext* encoding.  Only set when the ``SMTP`` class was instantiated
+      with ``enable_DSN=True``.
+
+   .. attribute:: dsn_ret
+      :type: Optional[str]
+
+      Defaulting to None, this attribute holds the ``RET`` parameter of the
+      ``MAIL FROM`` command (:rfc:`3461`); either ``"FULL"`` or ``"HDRS"``.
+      Only set when the ``SMTP`` class was instantiated with
+      ``enable_DSN=True``.
+
+   .. attribute:: rcpt_infos
+      :type: List[RcptInfo]
+
+      Defaulting to the empty list, this attribute holds one
+      :class:`RcptInfo` entry for every accepted recipient, in the exact
+      order the ``RCPT TO`` commands were accepted in.  Unlike
+      :attr:`rcpt_tos`, duplicate recipient addresses are preserved, each
+      with their own DSN parameters.
+
+
+.. class:: RcptInfo
+
+   A named tuple holding per-recipient information, including the
+   :rfc:`3461` DSN parameters given with the ``RCPT TO`` command.
+
+   .. attribute:: address
+      :type: str
+
+      The recipient address as given in the ``RCPT TO`` command.
+
+   .. attribute:: notify
+      :type: Optional[List[str]]
+
+      The values of the ``NOTIFY`` parameter (any of ``"SUCCESS"``,
+      ``"FAILURE"``, ``"DELAY"``, or ``"NEVER"``), in the order given by
+      the client; None if ``NOTIFY`` was not specified.
+
+   .. attribute:: orcpt
+      :type: Optional[str]
+
+      The value of the ``ORCPT`` parameter, verbatim as received (i.e.
+      still *xtext*-encoded, including the ``addr-type;`` prefix); None if
+      ``ORCPT`` was not specified.
+
 
 .. _peername: https://docs.python.org/3/library/asyncio-protocol.html?highlight=peername#asyncio.BaseTransport.get_extra_info
 .. |peername| replace:: ``peername``

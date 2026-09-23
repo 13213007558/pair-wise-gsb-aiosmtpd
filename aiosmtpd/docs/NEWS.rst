@@ -7,6 +7,17 @@
 1.4.7 (aiosmtpd-next)
 =====================
 
+Added
+-----
+
+* Support for RFC 3461 Delivery Status Notification (DSN) parameters,
+  enabled via the new ``enable_DSN`` parameter of the ``SMTP`` class.
+  The ``ENVID``/``RET`` parameters of ``MAIL FROM`` are exposed on the
+  envelope as ``envid``/``dsn_ret``, and the per-recipient
+  ``NOTIFY``/``ORCPT`` parameters of ``RCPT TO`` are exposed via the
+  ordered ``rcpt_infos`` list of ``RcptInfo`` named tuples.  Generating
+  the actual notification messages is left to the handler.
+
 Fixed/Improved
 --------------
 

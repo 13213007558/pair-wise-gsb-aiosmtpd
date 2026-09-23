@@ -159,6 +159,7 @@ aiosmtpd.smtp
    For more information, please refer to the :ref:`auth` page.
 
 .. class:: SMTP(handler, *, data_size_limit=33554432, enable_SMTPUTF8=False, \
+   enable_DSN=False, \
    decode_data=False, hostname=None, ident=None, tls_context=None, \
    require_starttls=False, timeout=300, auth_required=False, \
    auth_require_tls=True, auth_exclude_mechanism=None, auth_callback=None, \
@@ -189,6 +190,18 @@ aiosmtpd.smtp
 
       When ``True``, causes the ESMTP ``SMTPUTF8`` option to be returned to the client,
       and allows for UTF-8 content to be accepted, as defined in :rfc:`6531`.
+
+   .. py:attribute:: enable_DSN
+      :type: bool
+      :value: False
+      :noindex:
+
+      When ``True``, causes the ESMTP ``DSN`` option to be returned to the client,
+      and enables processing of the :rfc:`3461` Delivery Status Notification
+      parameters: ``ENVID`` and ``RET`` on ``MAIL FROM``, and ``NOTIFY`` and
+      ``ORCPT`` on ``RCPT TO``.  The parsed parameters are exposed to handlers
+      via the envelope's ``envid``, ``dsn_ret``, and ``rcpt_infos`` attributes;
+      generating the actual notification messages is left to the handler.
 
    .. py:attribute:: decode_data
       :type: bool
@@ -427,6 +440,10 @@ aiosmtpd.smtp
    .. attribute:: enable_SMTPUTF8
 
       The value of the *enable_SMTPUTF8* argument passed into the constructor.
+
+   .. attribute:: enable_DSN
+
+      The value of the *enable_DSN* argument passed into the constructor.
 
    .. attribute:: hostname
 
