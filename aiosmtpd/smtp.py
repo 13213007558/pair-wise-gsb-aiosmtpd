@@ -319,6 +319,7 @@ class SMTP(asyncio.StreamReaderProtocol):
             *,
             data_size_limit: Optional[int] = DATA_SIZE_DEFAULT,
             enable_SMTPUTF8: bool = False,
+            enable_CHUNKING: bool = False,
             decode_data: bool = False,
             hostname: Optional[str] = None,
             ident: Optional[str] = None,
@@ -344,6 +345,7 @@ class SMTP(asyncio.StreamReaderProtocol):
         assert data_size_limit is None or isinstance(data_size_limit, int)
         self.data_size_limit = data_size_limit
         self.enable_SMTPUTF8 = enable_SMTPUTF8
+        self.enable_CHUNKING = enable_CHUNKING
         self._decode_data = decode_data
         self.command_size_limits.clear()
         if hostname:
@@ -584,6 +586,11 @@ class SMTP(asyncio.StreamReaderProtocol):
     def _set_post_data_state(self):
         """Reset state variables to their post-DATA state."""
         self.envelope = self._create_envelope()
+        # RFC 3030 (CHUNKING/BDAT) per-transaction state
+        self._bdat_used: bool = False
+        self._bdat_failed: bool = False
+        self._bdat_total: int = 0
+        self._bdat_chunks: List[bytes] = []
 
     def _set_rset_state(self):
         """Reset all state variables except the greeting."""
@@ -851,6 +858,8 @@ class SMTP(asyncio.StreamReaderProtocol):
             self.command_size_limits['MAIL'] += 26
         if not self._decode_data:
             response.append('250-8BITMIME')
+        if self.enable_CHUNKING:
+            response.append('250-CHUNKING')
         if self.enable_SMTPUTF8:
             response.append('250-SMTPUTF8')
             self.command_size_limits['MAIL'] += 10
@@ -1306,9 +1315,15 @@ class SMTP(asyncio.StreamReaderProtocol):
             return
         if not self._decode_data:
             body = params.pop('BODY', '7BIT')
-            if body not in ['7BIT', '8BITMIME']:
+            valid_bodies = ['7BIT', '8BITMIME']
+            if self.enable_CHUNKING:
+                # RFC 3030: BODY=BINARYMIME is only acceptable once the
+                # CHUNKING extension has been enabled and advertised.
+                valid_bodies.append('BINARYMIME')
+            if body not in valid_bodies:
                 await self.push(
-                    '501 Error: BODY can only be one of 7BIT, 8BITMIME')
+                    '501 Error: BODY can only be one of '
+                    + ', '.join(valid_bodies))
                 return
         smtputf8 = params.pop('SMTPUTF8', False)
         if not isinstance(smtputf8, bool):
@@ -1416,6 +1431,12 @@ class SMTP(asyncio.StreamReaderProtocol):
         if not self.envelope.rcpt_tos:
             await self.push('503 Error: need RCPT command')
             return
+        if self._bdat_used:
+            # RFC 3030: DATA and BDAT must not be mixed in one transaction.
+            await self.push(
+                '503 Error: BDAT and DATA cannot be mixed '
+                'in the same transaction')
+            return
         if arg:
             await self.push('501 Syntax: DATA')
             return
@@ -1498,6 +1519,16 @@ class SMTP(asyncio.StreamReaderProtocol):
         # Discard data immediately to prevent memory pressure
         data *= 0
 
+        await self._deliver_message(original_content)
+
+    async def _deliver_message(self, original_content: bytes) -> None:
+        """
+        Set the envelope content from original_content, invoke the DATA
+        handler hooks, and send the final status to the client.
+
+        Shared by smtp_DATA and smtp_BDAT (RFC 3030).
+        """
+        assert self.envelope is not None
         content: Union[str, bytes]
         if self._decode_data:
             if self.enable_SMTPUTF8:
@@ -1540,6 +1571,81 @@ class SMTP(asyncio.StreamReaderProtocol):
                     status = MISSING
         self._set_post_data_state()
         await self.push('250 OK' if status is MISSING else status)
+
+    @syntax('BDAT chunk-size [LAST]', when='enable_CHUNKING')
+    async def smtp_BDAT(self, arg: Optional[str]) -> None:
+        if not self.enable_CHUNKING:
+            await self.push('502 5.5.2 BDAT command not supported')
+            return
+        if await self.check_helo_needed():
+            return
+        if await self.check_auth_needed("BDAT"):
+            return
+        assert self.envelope is not None
+        if not self.envelope.rcpt_tos:
+            await self.push('503 Error: need RCPT command')
+            return
+        syntaxerr = '501 Syntax: BDAT chunk-size [LAST]'
+        if arg is None:
+            await self.push(syntaxerr)
+            return
+        parts = arg.split()
+        last = False
+        if len(parts) == 2:
+            if parts[1].upper() != 'LAST':
+                await self.push(syntaxerr)
+                return
+            last = True
+        elif len(parts) != 1:
+            await self.push(syntaxerr)
+            return
+        if not parts[0].isdigit():
+            await self.push(syntaxerr)
+            return
+        size = int(parts[0])
+        # Read exactly the declared number of bytes. Per RFC 3030 the chunk
+        # content is opaque binary data: no dot transparency, no line
+        # endings, no command parsing; it may contain NUL octets, CRLF
+        # sequences, and anything that looks like SMTP commands.
+        try:
+            chunk: bytes = await self._reader.readexactly(size)
+        except asyncio.CancelledError:
+            # The connection got reset during the BDAT command.
+            log.info('Connection lost during BDAT')
+            self._writer.close()
+            raise
+        except asyncio.IncompleteReadError:
+            # The client went away before sending the whole chunk; the
+            # message must not be delivered.
+            log.info('Connection lost during BDAT')
+            self._writer.close()
+            return
+        self._bdat_used = True
+        if not self._bdat_failed:
+            # The size limit accumulates over all chunks of the message.
+            self._bdat_total += size
+            if self.data_size_limit and self._bdat_total > self.data_size_limit:
+                # The declared chunk has already been consumed and is now
+                # discarded *before* the error status is sent, so binary
+                # data still in the pipeline cannot be mistaken for SMTP
+                # commands.
+                self._bdat_failed = True
+                self._bdat_chunks *= 0
+        if self._bdat_failed:
+            # Keep consuming (and discarding) chunks until the transaction
+            # ends with a LAST chunk or an RSET.
+            await self.push('552 Error: Too much mail data')
+            if last:
+                self._set_post_data_state()
+            return
+        self._bdat_chunks.append(chunk)
+        if not last:
+            await self.push('250 OK')
+            return
+        original_content: bytes = EMPTYBYTES.join(self._bdat_chunks)
+        # Discard data immediately to prevent memory pressure
+        self._bdat_chunks *= 0
+        await self._deliver_message(original_content)
 
     # Commands that have not been implemented.
     async def smtp_EXPN(self, arg: str):

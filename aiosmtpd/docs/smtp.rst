@@ -159,6 +159,7 @@ aiosmtpd.smtp
    For more information, please refer to the :ref:`auth` page.
 
 .. class:: SMTP(handler, *, data_size_limit=33554432, enable_SMTPUTF8=False, \
+   enable_CHUNKING=False, \
    decode_data=False, hostname=None, ident=None, tls_context=None, \
    require_starttls=False, timeout=300, auth_required=False, \
    auth_require_tls=True, auth_exclude_mechanism=None, auth_callback=None, \
@@ -189,6 +190,22 @@ aiosmtpd.smtp
 
       When ``True``, causes the ESMTP ``SMTPUTF8`` option to be returned to the client,
       and allows for UTF-8 content to be accepted, as defined in :rfc:`6531`.
+
+   .. py:attribute:: enable_CHUNKING
+      :type: bool
+      :value: False
+      :noindex:
+
+      When ``True``, enables the ``CHUNKING`` and ``BINARYMIME`` ESMTP
+      extensions as defined in :rfc:`3030`.  The server advertises
+      ``CHUNKING`` in the ``EHLO`` response, accepts ``BODY=BINARYMIME`` in
+      the ``MAIL`` command, and implements the ``BDAT`` command.  ``BDAT``
+      reads exactly the declared number of octets per chunk (no dot
+      transparency processing), and the assembled message is passed to the
+      usual ``DATA`` hooks once a ``LAST`` chunk arrives.  ``DATA`` and
+      ``BDAT`` cannot be mixed in the same transaction, and the
+      *data_size_limit* is enforced cumulatively across all chunks of a
+      message.
 
    .. py:attribute:: decode_data
       :type: bool
@@ -427,6 +444,10 @@ aiosmtpd.smtp
    .. attribute:: enable_SMTPUTF8
 
       The value of the *enable_SMTPUTF8* argument passed into the constructor.
+
+   .. attribute:: enable_CHUNKING
+
+      The value of the *enable_CHUNKING* argument passed into the constructor.
 
    .. attribute:: hostname
 
