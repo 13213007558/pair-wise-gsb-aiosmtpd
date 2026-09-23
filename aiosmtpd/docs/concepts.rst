@@ -143,12 +143,22 @@ completed, or in certain error conditions as mandated by :rfc:`5321`.
       contain the UTF-8 decoded string, otherwise it will contain the raw
       bytes.
 
+      This attribute stays None when the message is delivered through a
+      :ref:`MessageSpool <messagespool>` (see the
+      :meth:`handle_DATA_spooled`
+      hook).
+
    .. attribute:: original_content
       :type: bytes
 
       Defaulting to None, this attribute will contain the contents of the
       message as provided by the ``DATA`` command.  Unlike the :attr:`content`
       attribute, this attribute will always contain the raw bytes.
+
+      This attribute stays None when the message is delivered through a
+      :ref:`MessageSpool <messagespool>`; the spool's
+      :meth:`open() <aiosmtpd.smtp.MessageSpool.open>` stream provides the
+      equivalent raw bytes.
 
    .. attribute:: rcpt_tos
       :type: List[str]

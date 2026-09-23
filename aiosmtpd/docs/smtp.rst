@@ -160,6 +160,7 @@ aiosmtpd.smtp
 
 .. class:: SMTP(handler, *, data_size_limit=33554432, enable_SMTPUTF8=False, \
    decode_data=False, hostname=None, ident=None, tls_context=None, \
+   spool_threshold=None, spool_dir=None, \
    require_starttls=False, timeout=300, auth_required=False, \
    auth_require_tls=True, auth_exclude_mechanism=None, auth_callback=None, \
    authenticator=None, command_call_limit=None, \
@@ -197,6 +198,35 @@ aiosmtpd.smtp
       When ``True``, attempts to decode byte content in the ``DATA`` command,
       assigning the string value to the :ref:`envelope's <sessions_and_envelopes>`
       ``content`` attribute.
+
+   .. py:attribute:: spool_threshold
+      :type: Optional[int]
+      :value: None
+
+      When set to a number of bytes, enables *spooled delivery* of the
+      ``DATA`` command for handlers implementing the
+      :meth:`handle_DATA_spooled`
+      hook: the message content is collected into a
+      :class:`MessageSpool <aiosmtpd.smtp.MessageSpool>` which keeps at
+      most this many bytes in memory and rolls over to a temporary file once
+      the threshold would be exceeded. The spool is never read back into a
+      single ``bytes`` object for delivery.
+
+      When ``None`` (the default), or when the handler does not implement
+      ``handle_DATA_spooled``, the classic behavior is kept: the whole
+      message is accumulated in memory and delivered through
+      ``envelope.content`` / ``envelope.original_content``.
+
+   .. py:attribute:: spool_dir
+      :type: Optional[Union[str, os.PathLike]]
+      :value: None
+
+      Directory in which the temporary files of rolled-over spools are
+      created. When ``None``, the system default temporary directory is
+      used. The temporary files are anonymous (unlinked immediately on
+      platforms that support it) and are removed when the SMTP transaction
+      ends, unless the handler explicitly takes over ownership via
+      :meth:`MessageSpool.detach <aiosmtpd.smtp.MessageSpool.detach>`.
 
    .. py:attribute:: hostname
       :type: Optional[str]
@@ -517,6 +547,115 @@ aiosmtpd.smtp
          Setting ``log_client_response=True`` might cause leakage of sensitive information!
 
          :boldital:`DO NOT TURN ON` UNLESS ABSOLUTELY NECESSARY!
+
+.. _messagespool:
+
+MessageSpool
+============
+
+When the :class:`SMTP` class is instantiated with ``spool_threshold`` set
+and the handler implements
+:meth:`handle_DATA_spooled`,
+the content of the ``DATA`` command is collected into a ``MessageSpool``
+instance instead of a monolithic in-memory ``bytes`` object.
+
+.. class:: MessageSpool(threshold, *, dir=None)
+
+   A bounded-memory, seekable container for received message data.
+
+   Content is buffered in memory while it fits within ``threshold`` bytes;
+   the first write that would exceed the threshold moves (``rolls over``)
+   the whole content to an anonymous temporary file (created in ``dir``, or
+   the system default temporary directory), and subsequent writes go
+   straight to that file. Peak memory usage is therefore bounded by
+   ``threshold`` plus one write chunk (one line of at most
+   ``SMTP.line_length_limit`` bytes when written by the SMTP server).
+
+   The spool is owned by the SMTP transaction that created it. It is
+   discarded -- and its temporary file removed -- when the transaction
+   ends, in each of these situations:
+
+     * the handler hook returned or raised an exception,
+     * the client disconnected before the terminating
+       ``<CRLF>.<CRLF>`` was received,
+     * the transaction was reset (``RSET``) or the connection was lost,
+     * the temporary file could not be written (e.g. disk full).
+
+   A handler that wants to keep the content beyond the lifetime of the
+   transaction MUST explicitly take over ownership by calling
+   :meth:`detach`.
+
+   .. py:attribute:: size
+
+      Total number of bytes written to the spool.
+
+   .. py:attribute:: rolled
+
+      True if the content has rolled over from memory to a temporary file.
+
+   .. py:attribute:: detached
+
+      True if ownership of the content was transferred via :meth:`detach`.
+
+   .. py:attribute:: buffered
+
+      Number of content bytes currently held in memory.
+
+   .. py:attribute:: max_buffered
+
+      Peak number of content bytes held in memory so far; never exceeds
+      ``threshold``.
+
+   .. py:attribute:: write_chunk_count
+
+      Number of ``write()`` calls performed so far.
+
+   .. py:attribute:: max_write_chunk
+
+      Size of the largest single ``write()`` so far.
+
+   .. py:method:: write(data) -> int
+
+      Append ``data`` to the spool, rolling over to disk if needed.
+      If the temporary file cannot be written, the spool is closed and any
+      partial temporary file is removed before the exception is re-raised.
+
+   .. py:method:: open() -> BinaryIO
+
+      Return a readable, seekable binary stream over the content,
+      positioned at the beginning. The content is the *original* message
+      bytes as received: line endings are the CRLF pairs sent by the
+      client, and the RFC 5321 § 4.5.2 dot-transparency has been undone
+      (i.e. this is the streaming equivalent of
+      ``envelope.original_content``).
+
+   .. py:method:: open_text(encoding="utf-8", errors="surrogateescape") -> TextIO
+
+      Return a text stream decoding the content of :meth:`open`. This is
+      the streaming equivalent of the ``decode_data=True`` view
+      (``envelope.content`` as ``str``): no line-ending translation is
+      performed, so the text keeps the CRLF line endings of the raw bytes.
+      The returned stream is independent of the spool; closing it does not
+      affect the spool.
+
+   .. py:method:: check_decodable(encoding, errors="strict") -> bool
+
+      Stream-check that the whole content decodes with ``encoding``,
+      reading at most ``SPOOL_DECODE_CHUNK_SIZE`` bytes at a time.
+
+   .. py:method:: detach() -> BinaryIO
+
+      Transfer ownership of the content to the caller and return a
+      readable, seekable binary stream positioned at the beginning of the
+      content. After ``detach()``, the SMTP transaction will no longer
+      close the spool nor remove the temporary file; the caller is
+      responsible for the returned stream's lifecycle.
+
+   .. py:method:: close()
+
+      Discard the content and remove the temporary file, if any.
+      Idempotent; a no-op for the underlying stream if the spool was
+      detached.
 
 .. _tls:
 

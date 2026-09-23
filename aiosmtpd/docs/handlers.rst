@@ -98,6 +98,34 @@ The following hooks are currently supported (in alphabetical order):
    ``decode_data=False`` or ``decode_data=True``.
    See :attr:`Envelope.content` for more info.
 
+.. py:method:: handle_DATA_spooled(server, session, envelope, spool) -> str
+   :async:
+
+   :param spool: The :ref:`MessageSpool <messagespool>` containing the message
+   :return: Response message to be sent to the client
+
+   Called during ``DATA`` after the entire message has been received,
+   but only when the :class:`~aiosmtpd.smtp.SMTP` server was instantiated
+   with ``spool_threshold`` set. If both this hook and
+   :meth:`handle_DATA` are implemented, this hook takes precedence.
+
+   In contrast to :meth:`handle_DATA`, the message content is NOT
+   materialized as a single in-memory ``bytes``/``str`` object;
+   ``envelope.content`` and ``envelope.original_content`` are both
+   ``None``. Instead, the content is available through ``spool``, a
+   seekable source that is buffered in memory up to ``spool_threshold``
+   bytes and transparently rolls over to a temporary file beyond that.
+   Use :meth:`spool.open() <aiosmtpd.smtp.MessageSpool.open>` for the raw
+   (dot-transparency-removed) bytes, or
+   :meth:`spool.open_text() <aiosmtpd.smtp.MessageSpool.open_text>` for the
+   decoded view corresponding to ``decode_data=True``.
+
+   The ``spool`` is owned by the SMTP transaction and is discarded --
+   including its temporary file -- when this hook returns or raises. To
+   keep the content, the handler MUST call
+   :meth:`spool.detach() <aiosmtpd.smtp.MessageSpool.detach>` and take over
+   the returned stream.
+
 .. py:method:: handle_EHLO(server, session, envelope, hostname, responses) -> List[str]
    :async:
    :noindex:

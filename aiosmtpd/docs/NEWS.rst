@@ -7,6 +7,17 @@
 1.4.7 (aiosmtpd-next)
 =====================
 
+Added
+-----
+
+* Optional spooled delivery of ``DATA``: when the ``SMTP`` class is
+  instantiated with ``spool_threshold`` (and optionally ``spool_dir``) and
+  the handler implements the new ``handle_DATA_spooled`` hook, message
+  content is collected into a bounded-memory ``MessageSpool`` that rolls
+  over to a temporary file past the threshold, instead of being
+  accumulated in memory. Handlers implementing only ``handle_DATA`` are
+  unaffected.
+
 Fixed/Improved
 --------------
 
