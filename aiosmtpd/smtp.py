@@ -89,6 +89,7 @@ DATA_SIZE_DEFAULT = 2**25  # Where does this number come from, I wonder...
 EMPTY_BARR = bytearray()
 EMPTYBYTES = b''
 MISSING = _Missing.MISSING
+READ_CHUNK_SIZE = 65536
 VALID_AUTHMECH = re.compile(r"[A-Z0-9_-]+\Z")
 
 # https://tools.ietf.org/html/rfc3207.html#page-3
@@ -319,6 +320,7 @@ class SMTP(asyncio.StreamReaderProtocol):
             *,
             data_size_limit: Optional[int] = DATA_SIZE_DEFAULT,
             enable_SMTPUTF8: bool = False,
+            enable_CHUNKING: bool = False,
             decode_data: bool = False,
             hostname: Optional[str] = None,
             ident: Optional[str] = None,
@@ -344,6 +346,7 @@ class SMTP(asyncio.StreamReaderProtocol):
         assert data_size_limit is None or isinstance(data_size_limit, int)
         self.data_size_limit = data_size_limit
         self.enable_SMTPUTF8 = enable_SMTPUTF8
+        self.enable_CHUNKING = enable_CHUNKING
         self._decode_data = decode_data
         self.command_size_limits.clear()
         if hostname:
@@ -368,6 +371,11 @@ class SMTP(asyncio.StreamReaderProtocol):
         self._original_transport: Optional[asyncio.BaseTransport] = None
         self.session: Optional[Session] = None
         self.envelope: Optional[Envelope] = None
+        self._message_transfer_mode: Optional[str] = None
+        self._mail_body_binary = False
+        self._chunk_bytes = 0
+        self._chunk_data: List[bytes] = []
+        self._chunk_error: Optional[str] = None
         self.transport: Optional[asyncio.BaseTransport] = None
         self._handler_coroutine: Optional[asyncio.Task[None]] = None
         if not auth_require_tls and auth_required:
@@ -584,10 +592,73 @@ class SMTP(asyncio.StreamReaderProtocol):
     def _set_post_data_state(self):
         """Reset state variables to their post-DATA state."""
         self.envelope = self._create_envelope()
+        self._message_transfer_mode = None
+        self._mail_body_binary = False
+        self._chunk_bytes = 0
+        self._chunk_data = []
+        self._chunk_error = None
 
     def _set_rset_state(self):
         """Reset all state variables except the greeting."""
         self._set_post_data_state()
+
+    async def _read_exact_bytes(
+            self, size: int, *, discard: bool = False
+    ) -> Optional[bytes]:
+        if size == 0:
+            return EMPTYBYTES
+        chunks: Optional[List[bytes]] = None if discard else []
+        remaining = size
+        while remaining:
+            chunk = await self._reader.read(min(READ_CHUNK_SIZE, remaining))
+            if not chunk:
+                return None
+            if chunks is not None:
+                chunks.append(chunk)
+            remaining -= len(chunk)
+        if chunks is None:
+            return EMPTYBYTES
+        return EMPTYBYTES.join(chunks)
+
+    async def _deliver_message(
+            self, original_content: bytes, *, binary: bool = False
+    ) -> Optional[str]:
+        content: Union[str, bytes]
+        if not binary and self._decode_data:
+            if self.enable_SMTPUTF8:
+                content = original_content.decode(
+                    'utf-8', errors='surrogateescape')
+            else:
+                try:
+                    content = original_content.decode('ascii', errors='strict')
+                except UnicodeDecodeError:
+                    return None
+        else:
+            content = original_content
+
+        self.envelope.content = content
+        self.envelope.original_content = original_content
+
+        if "DATA" in self._handle_hooks:
+            status = await self._call_handler_hook('DATA')
+        else:
+            status = MISSING
+            if hasattr(self.event_handler, 'process_message'):
+                warn('Use handler.handle_DATA() instead of .process_message()',
+                     DeprecationWarning)
+                assert self.session is not None
+                args = (self.session.peer, self.envelope.mail_from,
+                        self.envelope.rcpt_tos, self.envelope.content)
+                if inspect.iscoroutinefunction(
+                        self.event_handler.process_message):
+                    status = await self.event_handler.process_message(*args)
+                else:
+                    status = self.event_handler.process_message(*args)
+                if status is None:
+                    status = MISSING
+
+        self._set_post_data_state()
+        return '250 OK' if status is MISSING else status
 
     async def push(self, status: AnyStr):
         if isinstance(status, str):
@@ -851,6 +922,9 @@ class SMTP(asyncio.StreamReaderProtocol):
             self.command_size_limits['MAIL'] += 26
         if not self._decode_data:
             response.append('250-8BITMIME')
+        if self.enable_CHUNKING:
+            response.append('250-BINARYMIME')
+            response.append('250-CHUNKING')
         if self.enable_SMTPUTF8:
             response.append('250-SMTPUTF8')
             self.command_size_limits['MAIL'] += 10
@@ -1304,12 +1378,20 @@ class SMTP(asyncio.StreamReaderProtocol):
         if params is None:
             await self.push(syntaxerr)
             return
-        if not self._decode_data:
-            body = params.pop('BODY', '7BIT')
-            if body not in ['7BIT', '8BITMIME']:
+        self._mail_body_binary = False
+        body = params.pop('BODY', '7BIT')
+        if body == 'BINARYMIME':
+            if not self.enable_CHUNKING:
                 await self.push(
                     '501 Error: BODY can only be one of 7BIT, 8BITMIME')
                 return
+            self._mail_body_binary = True
+        elif body not in ['7BIT', '8BITMIME']:
+            message = '7BIT, 8BITMIME'
+            if self.enable_CHUNKING:
+                message += ', BINARYMIME'
+            await self.push(f'501 Error: BODY can only be one of {message}')
+            return
         smtputf8 = params.pop('SMTPUTF8', False)
         if not isinstance(smtputf8, bool):
             await self.push('501 Error: SMTPUTF8 takes no arguments')
@@ -1349,6 +1431,9 @@ class SMTP(asyncio.StreamReaderProtocol):
         assert self.envelope is not None
         if not self.envelope.mail_from:
             await self.push("503 Error: need MAIL command")
+            return
+        if self._chunk_error is not None:
+            await self.push("503 Error: send RSET before starting mail data")
             return
 
         syntaxerr = '501 Syntax: RCPT TO: <address>'
@@ -1406,6 +1491,92 @@ class SMTP(asyncio.StreamReaderProtocol):
         status = await self._call_handler_hook('RSET')
         await self.push('250 OK' if status is MISSING else status)
 
+    @syntax('BDAT chunk-size [LAST]', when='enable_CHUNKING')
+    async def smtp_BDAT(self, arg: Optional[str]) -> None:
+        if arg is None:
+            await self.push('501 Syntax: BDAT chunk-size [LAST]')
+            return
+        parts = arg.split()
+        if len(parts) > 2 or not parts[0].isascii() or not parts[0].isdigit():
+            await self.push('501 Syntax: BDAT chunk-size [LAST]')
+            return
+        if len(parts) == 2 and parts[1].upper() != 'LAST':
+            await self.push('501 Syntax: BDAT chunk-size [LAST]')
+            return
+
+        chunk_size = int(parts[0])
+        last = len(parts) == 2
+        assert self.session is not None
+        assert self.envelope is not None
+
+        too_much_data = bool(
+            self.data_size_limit
+            and self._chunk_bytes + chunk_size > self.data_size_limit
+        )
+        reject_chunk = (
+            self._chunk_error is not None
+            or not self.session.host_name
+            or not self.session.extended_smtp
+            or not self.enable_CHUNKING
+            or (self._auth_required and not self.session.authenticated)
+            or not self.envelope.mail_from
+            or not self.envelope.rcpt_tos
+            or self._message_transfer_mode == 'DATA'
+            or too_much_data
+        )
+        chunk = await self._read_exact_bytes(chunk_size, discard=reject_chunk)
+        if chunk is None:
+            return
+
+        if await self.check_helo_needed():
+            return
+        if await self.check_auth_needed('BDAT'):
+            return
+        if not self.enable_CHUNKING:
+            await self.push('502 BDAT not implemented')
+            return
+        if not self.envelope.mail_from:
+            await self.push('503 Error: need MAIL command')
+            return
+        if not self.envelope.rcpt_tos:
+            await self.push('503 Error: need RCPT command')
+            return
+        if self._message_transfer_mode == 'DATA':
+            await self.push('503 Error: DATA and BDAT cannot be mixed')
+            return
+        self._message_transfer_mode = 'BDAT'
+        if self._chunk_error is not None:
+            status = self._chunk_error
+            if last:
+                self._set_post_data_state()
+            await self.push(status)
+            return
+
+        self._chunk_bytes += chunk_size
+        if too_much_data:
+            self._chunk_data = []
+            self._chunk_error = '552 Error: Too much mail data'
+            status = self._chunk_error
+            if last:
+                self._set_post_data_state()
+            await self.push(status)
+            return
+
+        if chunk_size:
+            self._chunk_data.append(chunk)
+        if not last:
+            await self.push('250 OK')
+            return
+
+        original_content = EMPTYBYTES.join(self._chunk_data)
+        status = await self._deliver_message(
+            original_content, binary=self._mail_body_binary)
+        if status is None:
+            self._set_post_data_state()
+            await self.push('500 Error: strict ASCII mode')
+        else:
+            await self.push(status)
+
     @syntax('DATA')
     async def smtp_DATA(self, arg: str) -> None:
         if await self.check_helo_needed():
@@ -1419,7 +1590,14 @@ class SMTP(asyncio.StreamReaderProtocol):
         if arg:
             await self.push('501 Syntax: DATA')
             return
+        if self._message_transfer_mode == 'BDAT':
+            await self.push('503 Error: DATA and BDAT cannot be mixed')
+            return
+        if self._mail_body_binary:
+            await self.push('503 Error: BINARYMIME requires BDAT')
+            return
 
+        self._message_transfer_mode = 'DATA'
         await self.push('354 End data with <CR><LF>.<CR><LF>')
         data: List[bytearray] = []
 
@@ -1498,48 +1676,11 @@ class SMTP(asyncio.StreamReaderProtocol):
         # Discard data immediately to prevent memory pressure
         data *= 0
 
-        content: Union[str, bytes]
-        if self._decode_data:
-            if self.enable_SMTPUTF8:
-                content = original_content.decode('utf-8', errors='surrogateescape')
-            else:
-                try:
-                    content = original_content.decode('ascii', errors='strict')
-                except UnicodeDecodeError:
-                    # This happens if enable_smtputf8 is false, meaning that
-                    # the server explicitly does not want to accept non-ascii,
-                    # but the client ignores that and sends non-ascii anyway.
-                    await self.push('500 Error: strict ASCII mode')
-                    return
+        status = await self._deliver_message(original_content)
+        if status is None:
+            await self.push('500 Error: strict ASCII mode')
         else:
-            content = original_content
-        self.envelope.content = content
-        self.envelope.original_content = original_content
-
-        # Call the new API first if it's implemented.
-        if "DATA" in self._handle_hooks:
-            status = await self._call_handler_hook('DATA')
-        else:
-            # Backward compatibility.
-            status = MISSING
-            if hasattr(self.event_handler, 'process_message'):
-                warn('Use handler.handle_DATA() instead of .process_message()',
-                     DeprecationWarning)
-                assert self.session is not None
-                args = (self.session.peer, self.envelope.mail_from,
-                        self.envelope.rcpt_tos, self.envelope.content)
-                if inspect.iscoroutinefunction(
-                        self.event_handler.process_message):
-                    status = await self.event_handler.process_message(*args)
-                else:
-                    status = self.event_handler.process_message(*args)
-                # The deprecated API can return None which means, return the
-                # default status.  Don't worry about coverage for this case as
-                # it's a deprecated API that will go away after 1.0.
-                if status is None:                  # pragma: nocover
-                    status = MISSING
-        self._set_post_data_state()
-        await self.push('250 OK' if status is MISSING else status)
+            await self.push(status)
 
     # Commands that have not been implemented.
     async def smtp_EXPN(self, arg: str):

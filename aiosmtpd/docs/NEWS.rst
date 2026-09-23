@@ -7,6 +7,11 @@
 1.4.7 (aiosmtpd-next)
 =====================
 
+Added
+-----
+
+* Optional RFC 3030 CHUNKING and BINARYMIME support through ``enable_CHUNKING``
+
 Fixed/Improved
 --------------
 

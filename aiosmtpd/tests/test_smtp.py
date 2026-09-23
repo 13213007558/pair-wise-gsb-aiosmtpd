@@ -29,6 +29,7 @@ from pytest_mock import MockFixture
 from .conftest import Global, controller_data, handler_data
 from aiosmtpd.controller import Controller
 from aiosmtpd.handlers import Sink
+from aiosmtpd.lmtp import LMTP
 from aiosmtpd.smtp import (
     BOGUS_LIMIT,
     CALL_LIMIT_DEFAULT,
@@ -415,6 +416,9 @@ class _CommonMethods:
 
 
 class TestProtocol:
+    def test_lmtp_does_not_enable_chunking(self):
+        assert LMTP(Sink(), enable_CHUNKING=True).enable_CHUNKING is False
+
     def test_honors_mail_delimiters(
         self, temp_event_loop, transport_resp, get_protocol
     ):
@@ -461,6 +465,332 @@ class TestProtocol:
         assert responses[5] == S.S250_OK.to_bytes() + b"\r\n"
         assert len(handler.box) == 1
         assert handler.box[0].content == b""
+
+    def test_bdat_binary_chunks(self, temp_event_loop, transport_resp, get_protocol):
+        handler = ReceivingHandler()
+        protocol = get_protocol(handler, enable_CHUNKING=True)
+        first_chunk = b"a\x00\r\n.\r\nM"
+        second_chunk = b"AIL"
+        message = first_chunk + second_chunk
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com> BODY=BINARYMIME\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            + f"BDAT {len(first_chunk)}\r\n".encode()
+            + first_chunk
+            + f"BDAT {len(second_chunk)} LAST\r\n".encode()
+            + second_chunk
+            + b"NOOP\r\n"
+            + b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert b"250-BINARYMIME\r\n" in responses
+        assert b"250-CHUNKING\r\n" in responses
+        assert responses[-4:] == [
+            b"250 OK\r\n",
+            b"250 OK\r\n",
+            b"250 OK\r\n",
+            b"221 Bye\r\n",
+        ]
+        assert len(handler.box) == 1
+        assert handler.box[0].content == message
+        assert handler.box[0].original_content == message
+
+    def test_bdat_failure_drains_pipelined_chunks(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(
+            handler,
+            enable_CHUNKING=True,
+            data_size_limit=10,
+        )
+        first_chunk = b"MAIL FROM:<"
+        second_chunk = b"NOOP"
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com>\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            + f"BDAT {len(first_chunk)}\r\n".encode()
+            + first_chunk
+            + f"BDAT {len(second_chunk)} LAST\r\n".encode()
+            + second_chunk
+            + b"NOOP\r\n"
+            + b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-4:] == [
+            b"552 Error: Too much mail data\r\n",
+            b"552 Error: Too much mail data\r\n",
+            b"250 OK\r\n",
+            b"221 Bye\r\n",
+        ]
+        assert handler.box == []
+
+    def test_bdat_failure_requires_rset_before_new_transaction_command(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(
+            handler,
+            enable_CHUNKING=True,
+            data_size_limit=10,
+        )
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com>\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            b"BDAT 11\r\n"
+            b"abcdefghijk"
+            b"RCPT TO: <cate@example.com>\r\n"
+            b"RSET\r\n"
+            b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-3:] == [
+            b"503 Error: send RSET before starting mail data\r\n",
+            b"250 OK\r\n",
+            b"221 Bye\r\n",
+        ]
+        assert handler.box == []
+
+    def test_bdat_zero_last_is_empty(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(handler, enable_CHUNKING=True)
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com>\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            b"BDAT 0 LAST\r\n"
+            b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-2:] == [b"250 OK\r\n", b"221 Bye\r\n"]
+        assert len(handler.box) == 1
+        assert handler.box[0].content == b""
+
+    def test_data_after_bdat_rejected(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(handler, enable_CHUNKING=True)
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com>\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            b"BDAT 1\r\n"
+            b"X"
+            b"DATA\r\n"
+            b"RSET\r\n"
+            b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-3:] == [
+            b"503 Error: DATA and BDAT cannot be mixed\r\n",
+            b"250 OK\r\n",
+            b"221 Bye\r\n",
+        ]
+        assert handler.box == []
+
+    def test_rset_clears_incomplete_bdat_transaction(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(handler, enable_CHUNKING=True)
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com>\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            b"BDAT 1\r\n"
+            b"X"
+            b"RSET\r\n"
+            b"MAIL FROM: <cate@example.com>\r\n"
+            b"RCPT TO: <dave@example.com>\r\n"
+            b"BDAT 0 LAST\r\n"
+            b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-4:] == [
+            b"250 OK\r\n",
+            b"250 OK\r\n",
+            b"250 OK\r\n",
+            b"221 Bye\r\n",
+        ]
+        assert len(handler.box) == 1
+        assert handler.box[0].mail_from == "cate@example.com"
+        assert handler.box[0].content == b""
+
+    def test_binarymime_requires_advertised_extension(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(handler, enable_CHUNKING=False)
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com> BODY=BINARYMIME\r\n"
+            b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-2:] == [
+            b"501 Error: BODY can only be one of 7BIT, 8BITMIME\r\n",
+            b"221 Bye\r\n",
+        ]
+        assert handler.box == []
+
+    def test_bdat_without_extension_drains_declared_chunk(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(handler, enable_CHUNKING=False)
+        chunk = b"NOOP\r\n"
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com>\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            + f"BDAT {len(chunk)}\r\n".encode()
+            + chunk
+            + b"NOOP\r\n"
+            + b"QUIT\r\n"
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-3:] == [
+            b"502 BDAT not implemented\r\n",
+            b"250 OK\r\n",
+            b"221 Bye\r\n",
+        ]
+        assert handler.box == []
+
+    def test_bdat_disconnect_does_not_call_handler(
+        self, temp_event_loop, transport_resp, get_protocol
+    ):
+        handler = ReceivingHandler()
+        protocol = get_protocol(handler, enable_CHUNKING=True)
+        protocol.data_received(
+            b"EHLO example.org\r\n"
+            b"MAIL FROM: <anne@example.com> BODY=BINARYMIME\r\n"
+            b"RCPT TO: <bart@example.com>\r\n"
+            b"BDAT 4\r\n"
+            b"abc"
+        )
+        temp_event_loop.call_later(
+            0.01, protocol.connection_lost, ConnectionResetError()
+        )
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        assert responses[-1] == b"250 OK\r\n"
+        assert handler.box == []
+
+
+@pytest.mark.usefixtures("plain_controller")
+@controller_data(enable_CHUNKING=True)
+@handler_data(class_=ReceivingHandler)
+class TestChunking:
+    @staticmethod
+    def _send_bytewise(sock: socket.socket, data: bytes) -> None:
+        for octet in data:
+            sock.sendall(bytes([octet]))
+
+    @staticmethod
+    def _read_reply(responses) -> bytes:
+        lines = []
+        line = responses.readline()
+        assert line
+        lines.append(line)
+        while line[3:4] == b"-":
+            line = responses.readline()
+            assert line
+            lines.append(line)
+        return b"".join(lines)
+
+    def test_bdat_binary_chunks_byte_splitting(self, plain_controller):
+        handler: ReceivingHandler = plain_controller.handler
+        with socket.create_connection(Global.SrvAddr) as sock:
+            responses = sock.makefile("rb")
+            assert self._read_reply(responses).startswith(b"220 ")
+            self._send_bytewise(sock, b"EHLO example.com\r\n")
+            ehlo = self._read_reply(responses)
+            assert b"250-BINARYMIME\r\n" in ehlo
+            assert b"250-CHUNKING\r\n" in ehlo
+
+            self._send_bytewise(
+                sock,
+                b"MAIL FROM:<anne@example.com> BODY=BINARYMIME\r\n",
+            )
+            assert self._read_reply(responses) == b"250 OK\r\n"
+            self._send_bytewise(sock, b"RCPT TO:<bart@example.com>\r\n")
+            assert self._read_reply(responses) == b"250 OK\r\n"
+
+            first_chunk = (
+                b"x\x00\r\n.\r\n"
+                b"MAIL FROM:<evil@example.com>\r\n"
+                b"RCPT TO:<vi"
+            )
+            second_chunk = b"ctim@example.com>\r\nDATA\r\n.\r\n\x00tail"
+            self._send_bytewise(
+                sock, f"BDAT {len(first_chunk)}\r\n".encode() + first_chunk
+            )
+            assert self._read_reply(responses) == b"250 OK\r\n"
+            self._send_bytewise(
+                sock,
+                f"BDAT {len(second_chunk)}\r\n".encode() + second_chunk,
+            )
+            assert self._read_reply(responses) == b"250 OK\r\n"
+
+            self._send_bytewise(sock, b"BDAT 0 LAST\r\nNOOP\r\n")
+            assert self._read_reply(responses) == b"250 OK\r\n"
+            assert self._read_reply(responses) == b"250 OK\r\n"
+            responses.detach()
+
+        assert len(handler.box) == 1
+        envelope = handler.box[0]
+        assert envelope.content == first_chunk + second_chunk
+        assert envelope.original_content == first_chunk + second_chunk
+        assert "BODY=BINARYMIME" in envelope.mail_options
+
+    @controller_data(enable_CHUNKING=True, data_size_limit=10)
+    def test_failed_chunk_is_drained_and_pipeline_resumes(self):
+        first_chunk = b"MAIL FROM:<evil@example.com>\r\n"
+        second_chunk = b"RCPT TO:<victim@example.com>\r\n"
+        with socket.create_connection(Global.SrvAddr) as sock:
+            responses = sock.makefile("rb")
+            self._read_reply(responses)
+            sock.sendall(b"EHLO example.com\r\n")
+            self._read_reply(responses)
+            sock.sendall(b"MAIL FROM:<anne@example.com>\r\n")
+            self._read_reply(responses)
+            sock.sendall(b"RCPT TO:<bart@example.com>\r\n")
+            self._read_reply(responses)
+            sock.sendall(
+                f"BDAT {len(first_chunk)}\r\n".encode()
+                + first_chunk
+                + f"BDAT {len(second_chunk)} LAST\r\n".encode()
+                + second_chunk
+                + b"NOOP\r\n"
+            )
+            too_much = b"552 Error: Too much mail data\r\n"
+            assert self._read_reply(responses) == too_much
+            assert self._read_reply(responses) == too_much
+            assert self._read_reply(responses) == b"250 OK\r\n"
+            responses.detach()
 
 
 @pytest.mark.usefixtures("plain_controller")
