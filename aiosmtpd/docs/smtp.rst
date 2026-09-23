@@ -162,7 +162,7 @@ aiosmtpd.smtp
    decode_data=False, hostname=None, ident=None, tls_context=None, \
    require_starttls=False, timeout=300, auth_required=False, \
    auth_require_tls=True, auth_exclude_mechanism=None, auth_callback=None, \
-   authenticator=None, command_call_limit=None, \
+   authenticator=None, auth_external_callback=None, command_call_limit=None, \
    proxy_protocol_timeout=None, \
    loop=None)
 
@@ -297,10 +297,28 @@ aiosmtpd.smtp
 
       A function whose signature is identical to ``aiosmtpd.smtp.AuthenticatorType``.
 
-      See :func:`Authenticator` for more information.
+     See :func:`Authenticator` for more information.
 
-      .. versionadded:: 1.3
+     .. versionadded:: 1.3
 
+   .. py:attribute:: auth_external_callback
+      :type: aiosmtpd.smtp.AuthExternalCallbackType
+      :value: None
+
+      A function that authorizes the SASL ``EXTERNAL`` mechanism.
+      It is invoked as ``callback(peercert, authzid)`` where ``peercert`` is
+      the client certificate as verified by the TLS handshake (in the form
+      returned by :meth:`ssl.SSLSocket.getpeercert`) and ``authzid`` is the
+      requested authorization identity (``None`` when the client sent an
+      empty authzid, i.e. asking for the certificate's default identity).
+
+      The function must return the identity (``str``) the session is
+      authorized as, or ``None`` to reject the authorization mapping.
+
+      ``EXTERNAL`` is only advertised in ``EHLO`` -- and only accepted in
+      ``AUTH`` -- when this callback is set *and* the current TLS session
+      actually verified the peer's certificate; an encrypted connection
+      without a verified client certificate is not enough.
    .. py:attribute:: command_call_limit
       :type: Optional[Union[int, Dict[str, int]]]
       :value: None

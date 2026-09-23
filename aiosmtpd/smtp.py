@@ -58,6 +58,19 @@ class _DataState(enum.Enum):
 
 
 AuthCallbackType = Callable[[str, bytes, bytes], bool]
+AuthExternalCallbackType = Callable[[Dict[str, Any], Optional[str]], Optional[str]]
+"""
+Callback type for the SASL EXTERNAL mechanism.
+
+Invoked as ``callback(peercert, authzid)`` where ``peercert`` is the client
+certificate as verified by the TLS handshake (in the dict form returned by
+``ssl.SSLSocket.getpeercert()``) and ``authzid`` is the requested
+authorization identity (``None`` if the client sent an empty authzid, i.e.
+asking to use the certificate's default identity).
+
+Must return the identity (``str``) the session is authorized as, or ``None``
+to reject the authorization mapping.
+"""
 AuthenticatorType = Callable[["SMTP", "Session", "Envelope", str, Any], "AuthResult"]
 AuthMechanismType = Callable[["SMTP", List[str]], Awaitable[Any]]
 _TriStateType = Union[None, _Missing, bytes]
@@ -75,6 +88,7 @@ PeerType = Union[tuple[str, int], tuple[str, int, int, int], str, None]
 
 __all__ = [
     "AuthCallbackType",
+    "AuthExternalCallbackType",
     "AuthMechanismType",
     "MISSING",
     "__version__",
@@ -331,6 +345,7 @@ class SMTP(asyncio.StreamReaderProtocol):
             auth_callback: Optional[AuthCallbackType] = None,
             command_call_limit: Union[int, Dict[str, int], None] = None,
             authenticator: Optional[AuthenticatorType] = None,
+            auth_external_callback: Optional[AuthExternalCallbackType] = None,
             proxy_protocol_timeout: Optional[Union[int, float]] = None,
             loop: Optional[asyncio.AbstractEventLoop] = None
     ):
@@ -406,6 +421,7 @@ class SMTP(asyncio.StreamReaderProtocol):
         }
         for m in (auth_exclude_mechanism or []):
             self._auth_methods.pop(m, None)
+        self._auth_external_callback = auth_external_callback
         log.info(
             "Available AUTH mechanisms: "
             + " ".join(
@@ -857,9 +873,13 @@ class SMTP(asyncio.StreamReaderProtocol):
         if self.tls_context and not self._tls_protocol:
             response.append('250-STARTTLS')
         if not self._auth_require_tls or self._tls_protocol:
-            response.append(
-                "250-AUTH " + " ".join(sorted(self._auth_methods.keys()))
-            )
+            auth_mechs = sorted(self._auth_methods.keys())
+            if "EXTERNAL" in auth_mechs and not self._external_auth_available():
+                # SASL EXTERNAL must only be offered when the current TLS
+                # session has actually verified the peer's certificate.
+                auth_mechs.remove("EXTERNAL")
+            if auth_mechs:
+                response.append("250-AUTH " + " ".join(auth_mechs))
 
         if hasattr(self, 'ehlo_hook'):
             warn('Use handler.handle_EHLO() instead of .ehlo_hook()',
@@ -1121,6 +1141,38 @@ class SMTP(asyncio.StreamReaderProtocol):
     #    more advanced auth mechanism might not return login+password pair
     #    (see #2 above)
 
+    def _get_tls_peercert(self) -> Optional[Dict[str, Any]]:
+        """
+        Return the peer certificate of the current session, but ONLY if the
+        current TLS session actually verified it during the handshake.
+
+        Anything short of that -- a plaintext connection, an encrypted
+        connection where the peer sent no certificate or an unvalidated
+        certificate, or certificate-like data smuggled in by a reverse
+        proxy -- returns None.
+        """
+        transport = self.transport
+        if transport is None:
+            return None
+        get_extra_info = getattr(transport, "get_extra_info", None)
+        if get_extra_info is None:
+            return None
+        peercert = get_extra_info("peercert")
+        # ssl.SSLSocket.getpeercert() returns None if the peer did not send
+        # a certificate, and an empty dict if a certificate was sent but NOT
+        # validated. Only a non-empty dict means the TLS handshake verified
+        # the peer's certificate chain.
+        if not isinstance(peercert, dict) or not peercert:
+            return None
+        return peercert
+
+    def _external_auth_available(self) -> bool:
+        """True if SASL EXTERNAL can succeed on the current connection."""
+        return (
+            self._auth_external_callback is not None
+            and self._get_tls_peercert() is not None
+        )
+
     async def auth_PLAIN(self, _, args: List[str]) -> AuthResult:
         login_and_password: _TriStateType
         if len(args) == 1:
@@ -1169,6 +1221,64 @@ class SMTP(asyncio.StreamReaderProtocol):
         assert password is not None
 
         return self._authenticate("LOGIN", LoginPassword(login, password))
+
+    async def auth_EXTERNAL(self, _, args: List[str]) -> AuthResult:
+        """
+        SASL EXTERNAL mechanism (RFC 4422 appendix A, RFC 4954).
+
+        The authentication identity is taken from the client certificate
+        verified by the current TLS session; whether that identity may
+        represent the requested authzid is decided by the
+        ``auth_external_callback`` given to the SMTP class.
+        """
+        if not self._external_auth_available():
+            # EXTERNAL is not advertised in EHLO in this situation either;
+            # as far as the client is concerned the mechanism is unavailable.
+            await self.push("504 5.5.4 Unrecognized authentication type")
+            return AuthResult(success=False, handled=True)
+        peercert = self._get_tls_peercert()
+        callback = self._auth_external_callback
+        assert peercert is not None and callback is not None
+        authzid_bytes: bytes
+        if len(args) == 1:
+            # No initial response; ask for the authzid with an empty
+            # challenge (RFC 4954 section 4).
+            challenge_response = await self.challenge_auth("")
+            if challenge_response is MISSING:
+                return AuthResult(success=False)
+            authzid_bytes = challenge_response
+        else:
+            initial = args[1]
+            if initial == "*":
+                # Client cancelling the exchange (RFC 4954 section 4)
+                assert self.session is not None
+                log.warning("%r aborted AUTH with '*'", self.session.peer)
+                await self.push("501 5.7.0 Auth aborted")
+                return AuthResult(success=False, handled=True)
+            elif initial == "=":
+                # RFC 4954 section 4: "=" means an empty initial response
+                authzid_bytes = b""
+            else:
+                try:
+                    authzid_bytes = b64decode(initial.encode(), validate=True)
+                except Exception:
+                    await self.push("501 5.5.2 Can't decode base64")
+                    return AuthResult(success=False, handled=True)
+        authzid: Optional[str]
+        if authzid_bytes:
+            try:
+                authzid = authzid_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                await self.push("501 5.5.2 Can't decode authzid as UTF-8")
+                return AuthResult(success=False, handled=True)
+        else:
+            # Empty authzid: use the certificate's default identity
+            authzid = None
+        identity = callback(peercert, authzid)
+        if identity is None:
+            # The authorization mapping rejected the (cert, authzid) pair
+            return AuthResult(success=False, handled=False)
+        return AuthResult(success=True, handled=True, auth_data=identity)
 
     def _strip_command_keyword(self, keyword: str, arg: str) -> Optional[str]:
         keylen = len(keyword)

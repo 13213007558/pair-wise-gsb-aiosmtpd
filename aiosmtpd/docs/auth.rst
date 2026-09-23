@@ -83,10 +83,21 @@ that the hook will implement.
    Alternatively, you can also use the :func:`~aiosmtpd.smtp.auth_mechanism` decorator,
    which you can import from the :mod:`aiosmtpd.smtp` module.
 
-The SMTP class provides built-in AUTH hooks for the ``LOGIN`` and ``PLAIN``
-mechanisms, named ``auth_LOGIN`` and ``auth_PLAIN``, respectively.
-If the handler class implements ``auth_LOGIN`` and/or ``auth_PLAIN``, then
+The SMTP class provides built-in AUTH hooks for the ``LOGIN``, ``PLAIN``, and
+``EXTERNAL`` mechanisms, named ``auth_LOGIN``, ``auth_PLAIN``, and
+``auth_EXTERNAL``, respectively.
+If the handler class implements ``auth_LOGIN``, ``auth_PLAIN``, and/or
+``auth_EXTERNAL``, then
 the methods of the handler instance will override the built-in methods.
+
+The built-in ``EXTERNAL`` hook implements SASL ``EXTERNAL`` (:rfc:`4422`):
+the authentication identity is taken from the client certificate verified by
+the current TLS session, and the function given as the
+:attr:`auth_external_callback <SMTP.auth_external_callback>` parameter
+decides whether that identity may represent the requested authorization
+identity (authzid).
+The mechanism is only offered when a verified client certificate is present
+on the current TLS session.
 
 .. py:method:: auth_MECHANISM(server: SMTP, args: List[str]) -> aiosmtpd.smtp.AuthResult
    :async:
