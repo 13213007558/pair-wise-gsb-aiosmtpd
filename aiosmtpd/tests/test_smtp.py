@@ -2062,3 +2062,312 @@ class TestSanitize:
         expect = "AuthResult(success=True, handled=True, message=None, auth_data=...)"
         assert repr(ar) == expect
         assert str(ar) == expect
+
+
+class BDATRecordingHandler:
+    def __init__(self):
+        self.envelopes: List[SMTPEnvelope] = []
+
+    async def handle_DATA(self, server, session, envelope):
+        self.envelopes.append(envelope)
+        return "250 OK"
+
+
+class RawSMTPClient:
+    """Minimal raw-socket SMTP client allowing arbitrary byte-level writes."""
+
+    def __init__(self, host: str, port: int):
+        self.sock = socket.create_connection((host, port), timeout=5)
+        self.sock.settimeout(5)
+        self.file = self.sock.makefile("rb")
+        self.greeting = self.read_response()
+
+    def read_response(self) -> bytes:
+        lines = []
+        while True:
+            line = self.file.readline()
+            assert line, "server closed connection unexpectedly"
+            lines.append(line)
+            # Last line of a reply has a space after the 3-digit code
+            if len(line) >= 4 and line[3:4] == b" ":
+                return b"".join(lines)
+
+    def send_raw(self, data: bytes):
+        self.sock.sendall(data)
+
+    def command(self, cmd: bytes) -> bytes:
+        self.send_raw(cmd + BCRLF)
+        return self.read_response()
+
+    def close(self):
+        with suppress(OSError):
+            self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+
+@pytest.fixture
+def bdat_controller(get_controller):
+    handler = BDATRecordingHandler()
+    controller = get_controller(handler, enable_CHUNKING=True)
+    controller.start()
+    Global.set_addr_from(controller)
+    #
+    yield handler
+    #
+    with suppress(AssertionError):
+        controller.stop()
+
+
+def bdat_client() -> RawSMTPClient:
+    client = RawSMTPClient(*Global.SrvAddr)
+    assert client.greeting.startswith(b"220")
+    return client
+
+
+def bdat_envelope(client: RawSMTPClient, mail_from: bytes = b"<anne@example.com>"):
+    assert client.command(b"EHLO example.com").startswith(b"250")
+    assert client.command(b"MAIL FROM:" + mail_from).startswith(b"250")
+    assert client.command(b"RCPT TO:<bart@example.com>").startswith(b"250")
+
+
+class TestBDAT:
+    def test_ehlo_advertises_chunking(self, bdat_controller):
+        with bdat_client() as client:
+            response = client.command(b"EHLO example.com")
+            assert b"250-CHUNKING" in response
+            assert b"250-BINARYMIME" in response
+
+    def test_ehlo_no_chunking_when_disabled(self, plain_controller):
+        with bdat_client() as client:
+            response = client.command(b"EHLO example.com")
+            assert b"CHUNKING" not in response
+            assert b"BINARYMIME" not in response
+
+    def test_bdat_unrecognized_when_disabled(self, plain_controller):
+        with bdat_client() as client:
+            bdat_envelope(client)
+            assert client.command(b"BDAT 0 LAST").startswith(b"500")
+
+    def test_bdat_needs_ehlo(self, bdat_controller):
+        with bdat_client() as client:
+            assert client.command(b"HELO example.com").startswith(b"250")
+            assert client.command(b"MAIL FROM:<anne@example.com>").startswith(b"250")
+            assert client.command(b"RCPT TO:<bart@example.com>").startswith(b"250")
+            assert client.command(b"BDAT 0 LAST").startswith(b"500")
+
+    def test_bdat_needs_helo_first(self, bdat_controller):
+        with bdat_client() as client:
+            assert client.command(b"BDAT 0 LAST").startswith(b"503")
+
+    def test_bdat_needs_rcpt(self, bdat_controller):
+        with bdat_client() as client:
+            assert client.command(b"EHLO example.com").startswith(b"250")
+            assert client.command(b"MAIL FROM:<anne@example.com>").startswith(b"250")
+            assert client.command(b"BDAT 0 LAST").startswith(b"503")
+
+    @pytest.mark.parametrize("command", [
+        b"BDAT",
+        b"BDAT abc",
+        b"BDAT 1 2",
+        b"BDAT LAST",
+        b"BDAT -5",
+        b"BDAT 5 LAST EXTRA",
+    ])
+    def test_bdat_bad_syntax(self, bdat_controller, command):
+        with bdat_client() as client:
+            bdat_envelope(client)
+            assert client.command(command).startswith(b"501")
+
+    def test_bdat_zero_length_last(self, bdat_controller):
+        with bdat_client() as client:
+            bdat_envelope(client)
+            assert client.command(b"BDAT 0 LAST").startswith(b"250")
+        assert len(bdat_controller.envelopes) == 1
+        envelope = bdat_controller.envelopes[0]
+        assert envelope.content == b""
+        assert envelope.original_content == b""
+
+    def test_bdat_zero_length_non_last(self, bdat_controller):
+        with bdat_client() as client:
+            bdat_envelope(client)
+            assert client.command(b"BDAT 0").startswith(b"250")
+            client.send_raw(b"BDAT 5 LAST" + BCRLF)
+            client.send_raw(b"hello")
+            assert client.read_response().startswith(b"250")
+        assert bdat_controller.envelopes[0].content == b"hello"
+
+    def test_bdat_multi_chunk(self, bdat_controller):
+        with bdat_client() as client:
+            bdat_envelope(client)
+            client.send_raw(b"BDAT 13" + BCRLF)
+            client.send_raw(b"First chunk\r\n")
+            assert client.read_response().startswith(b"250")
+            client.send_raw(b"BDAT 14" + BCRLF)
+            client.send_raw(b"Second chunk\r\n")
+            assert client.read_response().startswith(b"250")
+            client.send_raw(b"BDAT 10 LAST" + BCRLF)
+            client.send_raw(b"Last chunk")
+            assert client.read_response().startswith(b"250")
+        expected = b"First chunk\r\nSecond chunk\r\nLast chunk"
+        assert bdat_controller.envelopes[0].content == expected
+        assert bdat_controller.envelopes[0].original_content == expected
+
+    def test_bdat_fragmented_binary(self, bdat_controller):
+        # The payload exercises everything DATA cannot carry transparently:
+        # NUL bytes, bare LFs, bare CRs, dot-leading lines, 8-bit bytes, and
+        # byte sequences that look exactly like SMTP commands.
+        payload = (
+            b"\x00\x01\x02 NUL bytes\x00\r\n"
+            b"bare\nnewline\n"
+            b"bare\rcarriage\rreturn\n"
+            b".line starting with a dot\r\n"
+            b"..double dot\r\n"
+            b"NOOP not a command\r\n"
+            b"RSET not a command either\r\n"
+            b"DATA \xff\xfe\x80 binary\x00 tail"
+        )
+        with bdat_client() as client:
+            bdat_envelope(client)
+            # Split the BDAT command line itself across TCP fragments.
+            client.send_raw(b"BD")
+            client.send_raw(b"AT " + str(len(payload)).encode("ascii") + b" LA")
+            client.send_raw(b"ST\r\n")
+            # Send the content byte-by-byte in awkward fragments.
+            for i in range(0, len(payload), 7):
+                client.send_raw(payload[i:i + 7])
+            assert client.read_response().startswith(b"250")
+            # The connection must still be usable and in sync: bytes inside
+            # the BDAT content were not reinterpreted as SMTP commands.
+            assert client.command(b"NOOP").startswith(b"250")
+        assert len(bdat_controller.envelopes) == 1
+        envelope = bdat_controller.envelopes[0]
+        assert envelope.content == payload
+        assert envelope.original_content == payload
+
+    def test_bdat_command_bytes_not_reinterpreted(self, bdat_controller):
+        # A chunk whose content is exactly an SMTP command line must be
+        # treated as opaque message bytes.
+        with bdat_client() as client:
+            bdat_envelope(client)
+            client.send_raw(b"BDAT 6 LAST" + BCRLF)
+            client.send_raw(b"QUIT\r\n")
+            assert client.read_response().startswith(b"250")
+            # Session is still alive; QUIT was content, not a command.
+            assert client.command(b"NOOP").startswith(b"250")
+        assert bdat_controller.envelopes[0].content == b"QUIT\r\n"
+
+    def test_bdat_size_limit(self, get_controller):
+        handler = BDATRecordingHandler()
+        controller = get_controller(
+            handler, enable_CHUNKING=True, data_size_limit=10)
+        controller.start()
+        Global.set_addr_from(controller)
+        try:
+            with bdat_client() as client:
+                bdat_envelope(client)
+                chunk = b"this chunk is way too large"
+                # Declared chunk exceeds the remaining allowance; the server
+                # must consume the chunk bytes before replying, so the
+                # command stream stays in sync.
+                client.send_raw(b"BDAT %d LAST" % len(chunk) + BCRLF)
+                client.send_raw(chunk)
+                assert client.read_response().startswith(b"552")
+                # After the failure the client can RSET and start over.
+                assert client.command(b"RSET").startswith(b"250")
+                bdat_envelope(client)
+                client.send_raw(b"BDAT 5 LAST" + BCRLF)
+                client.send_raw(b"fits!")
+                assert client.read_response().startswith(b"250")
+            assert len(handler.envelopes) == 1
+            assert handler.envelopes[0].content == b"fits!"
+        finally:
+            with suppress(AssertionError):
+                controller.stop()
+
+    def test_bdat_cumulative_size_limit(self, get_controller):
+        handler = BDATRecordingHandler()
+        controller = get_controller(
+            handler, enable_CHUNKING=True, data_size_limit=10)
+        controller.start()
+        Global.set_addr_from(controller)
+        try:
+            with bdat_client() as client:
+                bdat_envelope(client)
+                client.send_raw(b"BDAT 6" + BCRLF)
+                client.send_raw(b"123456")
+                assert client.read_response().startswith(b"250")
+                # 6 + 6 = 12 > 10, even though each chunk alone is fine.
+                client.send_raw(b"BDAT 6 LAST" + BCRLF)
+                client.send_raw(b"123456")
+                assert client.read_response().startswith(b"552")
+                assert client.command(b"RSET").startswith(b"250")
+            assert handler.envelopes == []
+        finally:
+            with suppress(AssertionError):
+                controller.stop()
+
+    def test_data_rejected_during_bdat(self, bdat_controller):
+        with bdat_client() as client:
+            bdat_envelope(client)
+            client.send_raw(b"BDAT 3" + BCRLF)
+            client.send_raw(b"abc")
+            assert client.read_response().startswith(b"250")
+            assert client.command(b"DATA").startswith(b"503")
+            # BDAT transaction can still complete normally afterwards.
+            client.send_raw(b"BDAT 3 LAST" + BCRLF)
+            client.send_raw(b"def")
+            assert client.read_response().startswith(b"250")
+        assert bdat_controller.envelopes[0].content == b"abcdef"
+
+    def test_rset_clears_bdat_state(self, bdat_controller):
+        with bdat_client() as client:
+            bdat_envelope(client)
+            client.send_raw(b"BDAT 3" + BCRLF)
+            client.send_raw(b"abc")
+            assert client.read_response().startswith(b"250")
+            assert client.command(b"RSET").startswith(b"250")
+            # DATA is legal again after the RSET.
+            bdat_envelope(client)
+            assert client.command(b"DATA").startswith(b"354")
+            client.send_raw(b"via DATA\r\n.\r\n")
+            assert client.read_response().startswith(b"250")
+        assert bdat_controller.envelopes[0].content == b"via DATA\r\n"
+
+    def test_binarymime_mail_parameter(self, bdat_controller):
+        with bdat_client() as client:
+            assert client.command(b"EHLO example.com").startswith(b"250")
+            response = client.command(
+                b"MAIL FROM:<anne@example.com> BODY=BINARYMIME")
+            assert response.startswith(b"250")
+            assert client.command(b"RCPT TO:<bart@example.com>").startswith(b"250")
+            # DATA must not be used for a BINARYMIME message (RFC 3030).
+            assert client.command(b"DATA").startswith(b"503")
+            client.send_raw(b"BDAT 8 LAST" + BCRLF)
+            client.send_raw(b"\x00binary\xff")
+            assert client.read_response().startswith(b"250")
+        assert bdat_controller.envelopes[0].content == b"\x00binary\xff"
+
+    def test_binarymime_rejected_when_disabled(self, plain_controller):
+        with bdat_client() as client:
+            assert client.command(b"EHLO example.com").startswith(b"250")
+            response = client.command(
+                b"MAIL FROM:<anne@example.com> BODY=BINARYMIME")
+            assert response.startswith(b"501")
+
+    def test_bdat_disconnect_mid_chunk(self, bdat_controller):
+        client = bdat_client()
+        bdat_envelope(client)
+        client.send_raw(b"BDAT 100 LAST\r\n")
+        client.send_raw(b"only ten by")
+        # Walk away in the middle of the declared chunk.
+        client.close()
+        catchup_delay()
+        # Nothing was delivered, and the server is still healthy.
+        assert bdat_controller.envelopes == []
+        with bdat_client() as client2:
+            assert client2.command(b"NOOP").startswith(b"250")
