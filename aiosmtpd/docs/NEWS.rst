@@ -4,6 +4,17 @@
 
 .. towncrier release notes start
 
+Unreleased
+==========
+
+Fixed/Improved
+--------------
+
+* ``LMTP`` now sends one final reply per accepted recipient after ``DATA``,
+  as required by :rfc:`2033`. A handler's ``handle_DATA()`` hook may return
+  a list of status strings, one per accepted recipient, in
+  ``envelope.rcpt_tos`` order. ``SMTP`` keeps its single-reply contract.
+
 1.4.7 (aiosmtpd-next)
 =====================
 
