@@ -94,6 +94,18 @@ VALID_AUTHMECH = re.compile(r"[A-Z0-9_-]+\Z")
 # https://tools.ietf.org/html/rfc3207.html#page-3
 ALLOWED_BEFORE_STARTTLS = {"NOOP", "EHLO", "STARTTLS", "QUIT"}
 
+# https://datatracker.ietf.org/doc/html/rfc3461#section-4
+# xtext = *( xchar / hexchar )
+# xchar = any ASCII CHAR between "!" (33) and "~" (126) inclusive,
+#         except "+" (43) and "=" (61)
+# hexchar = "+" followed by two hexadecimal digits
+_XTEXT_RE = re.compile(r"\A(?:[\x21-\x2a\x2c-\x3c\x3e-\x7e]|\+[0-9A-Fa-f]{2})*\Z")
+_XTEXT_HEXCHAR_RE = re.compile(r"\+([0-9A-Fa-f]{2})")
+
+_DSN_MAIL_PARAMS = ("RET", "ENVID")
+_DSN_RCPT_PARAMS = ("NOTIFY", "ORCPT")
+_DSN_NOTIFY_EVENTS = frozenset({"SUCCESS", "FAILURE", "DELAY"})
+
 # Auth hiding regexes
 CLIENT_AUTH_B = re.compile(
     # Matches "AUTH" <mechanism> <whitespace_but_not_\r_nor_\n>
@@ -204,6 +216,17 @@ class Envelope:
         self.original_content: Optional[bytes] = None
         self.rcpt_tos: List[str] = []
         self.rcpt_options: List[str] = []
+        self.dsn_ret: Optional[str] = None
+        """RFC 3461 RET parameter of MAIL FROM ("FULL" or "HDRS"), if given"""
+        self.dsn_envid: Optional[str] = None
+        """RFC 3461 ENVID parameter of MAIL FROM (xtext-decoded), if given"""
+        self.rcpt_dsn_params: List[Dict[str, Any]] = []
+        """
+        RFC 3461 DSN parameters of each accepted RCPT TO, kept aligned with
+        rcpt_tos. Each entry is a dict with keys "NOTIFY" (a list of
+        notification events, or None) and "ORCPT" (the xtext-decoded original
+        recipient address, or None).
+        """
 
 
 # This is here to enable debugging output when the -E option is given to the
@@ -257,6 +280,33 @@ def login_always_fail(
         mechanism: str, login: bytes, password: bytes
 ) -> bool:
     return False
+
+
+def _decode_xtext(value: str) -> Optional[str]:
+    """
+    Decode an RFC 3461 xtext string.
+
+    Returns None if the string is not valid xtext.
+    """
+    if _XTEXT_RE.match(value) is None:
+        return None
+    return _XTEXT_HEXCHAR_RE.sub(lambda m: chr(int(m.group(1), 16)), value)
+
+
+def _dsn_param_values(
+        options: Sequence[str], keyword: str
+) -> List[Optional[str]]:
+    """
+    Return the values of all ESMTP options matching keyword (case-insensitively).
+
+    Each value is None if the option appeared without "=".
+    """
+    values: List[Optional[str]] = []
+    for option in options:
+        key, eq, value = option.partition("=")
+        if key.upper() == keyword:
+            values.append(value if eq else None)
+    return values
 
 
 def is_int(o: Any) -> bool:
@@ -319,6 +369,7 @@ class SMTP(asyncio.StreamReaderProtocol):
             *,
             data_size_limit: Optional[int] = DATA_SIZE_DEFAULT,
             enable_SMTPUTF8: bool = False,
+            enable_DSN: bool = False,
             decode_data: bool = False,
             hostname: Optional[str] = None,
             ident: Optional[str] = None,
@@ -344,6 +395,7 @@ class SMTP(asyncio.StreamReaderProtocol):
         assert data_size_limit is None or isinstance(data_size_limit, int)
         self.data_size_limit = data_size_limit
         self.enable_SMTPUTF8 = enable_SMTPUTF8
+        self.enable_DSN = enable_DSN
         self._decode_data = decode_data
         self.command_size_limits.clear()
         if hostname:
@@ -854,6 +906,8 @@ class SMTP(asyncio.StreamReaderProtocol):
         if self.enable_SMTPUTF8:
             response.append('250-SMTPUTF8')
             self.command_size_limits['MAIL'] += 10
+        if self.enable_DSN:
+            response.append('250-DSN')
         if self.tls_context and not self._tls_protocol:
             response.append('250-STARTTLS')
         if not self._auth_require_tls or self._tls_protocol:
@@ -1328,6 +1382,32 @@ class SMTP(asyncio.StreamReaderProtocol):
                     '552 Error: message size exceeds fixed maximum message '
                     'size')
                 return
+        if self.enable_DSN:
+            # RFC 3461 § 5.1. RET and ENVID values are parsed from the
+            # original (non-uppercased) parameters because xtext is
+            # case-sensitive.
+            raw_options = addrparams.split()
+            for keyword in _DSN_MAIL_PARAMS:
+                values = _dsn_param_values(raw_options, keyword)
+                if len(values) > 1:
+                    await self.push(f'501 5.5.4 Duplicate {keyword} parameter')
+                    return
+                params.pop(keyword, None)
+                if not values:
+                    continue
+                value = values[0]
+                if keyword == 'RET':
+                    if value is None or value.upper() not in ('FULL', 'HDRS'):
+                        await self.push('501 5.5.4 Invalid RET parameter value')
+                        return
+                    self.envelope.dsn_ret = value.upper()
+                else:  # ENVID
+                    envid = _decode_xtext(value) if value is not None else None
+                    if envid is None:
+                        await self.push(
+                            '501 5.5.4 Invalid ENVID parameter value')
+                        return
+                    self.envelope.dsn_envid = envid
         if len(params) > 0:
             await self.push(
                 '555 MAIL FROM parameters not recognized or not implemented')
@@ -1378,18 +1458,72 @@ class SMTP(asyncio.StreamReaderProtocol):
         if params_dict is None:
             await self.push(syntaxerr)
             return
-        # XXX currently there are no options we recognize.
+        rcpt_dsn: Dict[str, Any] = {"NOTIFY": None, "ORCPT": None}
+        if self.enable_DSN:
+            # RFC 3461 § 5.2. ORCPT's value is parsed from the original
+            # (non-uppercased) parameters because xtext is case-sensitive.
+            raw_options = params.split()
+            for keyword in _DSN_RCPT_PARAMS:
+                values = _dsn_param_values(raw_options, keyword)
+                if len(values) > 1:
+                    await self.push(f'501 5.5.4 Duplicate {keyword} parameter')
+                    return
+                params_dict.pop(keyword, None)
+                if not values:
+                    continue
+                value = values[0]
+                if keyword == 'NOTIFY':
+                    events = value.upper().split(',') if value else []
+                    if not events:
+                        await self.push(
+                            '501 5.5.4 Invalid NOTIFY parameter value')
+                        return
+                    if 'NEVER' in events:
+                        if len(events) > 1:
+                            await self.push(
+                                '501 5.5.4 NOTIFY=NEVER cannot be combined '
+                                'with other events')
+                            return
+                    elif (any(event not in _DSN_NOTIFY_EVENTS
+                              for event in events)
+                            or len(set(events)) != len(events)):
+                        await self.push(
+                            '501 5.5.4 Invalid NOTIFY parameter value')
+                        return
+                    rcpt_dsn['NOTIFY'] = events
+                else:  # ORCPT
+                    addr_type, semicolon, xtext_addr = (
+                        (value or '').partition(';'))
+                    orcpt = (
+                        _decode_xtext(xtext_addr) if semicolon else None)
+                    if addr_type.upper() != 'RFC822' or orcpt is None:
+                        await self.push(
+                            '501 5.5.4 Invalid ORCPT parameter value')
+                        return
+                    rcpt_dsn['ORCPT'] = orcpt
         if len(params_dict) > 0:
             await self.push(
                 '555 RCPT TO parameters not recognized or not implemented'
             )
             return
 
-        status = await self._call_handler_hook('RCPT', address, rcpt_options)
+        # Record the DSN parameters before calling the hook so that a hook
+        # implementing handle_RCPT can inspect them; they are discarded again
+        # if the recipient gets rejected, keeping rcpt_dsn_params aligned
+        # with rcpt_tos.
+        self.envelope.rcpt_dsn_params.append(rcpt_dsn)
+        try:
+            status = await self._call_handler_hook('RCPT', address, rcpt_options)
+        except Exception:
+            self.envelope.rcpt_dsn_params.pop()
+            raise
         if status is MISSING:
             self.envelope.rcpt_tos.append(address)
             self.envelope.rcpt_options.extend(rcpt_options)
             status = '250 OK'
+        elif not (isinstance(status, (str, bytes))
+                  and status[:1] in ('2', b'2')):
+            self.envelope.rcpt_dsn_params.pop()
         log.info('%r recip: %s', self.session.peer, address)
         await self.push(status)
 

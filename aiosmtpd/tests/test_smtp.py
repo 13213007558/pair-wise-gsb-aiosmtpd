@@ -2062,3 +2062,257 @@ class TestSanitize:
         expect = "AuthResult(success=True, handled=True, message=None, auth_data=...)"
         assert repr(ar) == expect
         assert str(ar) == expect
+
+
+class DsnRejectingHandler:
+    """Rejects recipients whose local part starts with 'reject'."""
+
+    def __init__(self):
+        self.box: List[SMTPEnvelope] = []
+
+    async def handle_RCPT(self, server, session, envelope, address, options):
+        if address.startswith("reject"):
+            return "550 5.1.1 User unknown"
+        envelope.rcpt_tos.append(address)
+        envelope.rcpt_options.extend(options)
+        return "250 OK"
+
+    async def handle_DATA(self, server, session, envelope):
+        self.box.append(envelope)
+        return "250 OK"
+
+
+@pytest.fixture
+def dsn_controller(
+    get_controller: Callable[..., Controller]
+) -> Generator[Controller, None, None]:
+    handler = ReceivingHandler()
+    controller = get_controller(
+        handler,
+        decode_data=True,
+        enable_SMTPUTF8=True,
+        enable_DSN=True,
+    )
+    controller.start()
+    Global.set_addr_from(controller)
+    #
+    yield controller
+    #
+    controller.stop()
+
+
+@pytest.fixture
+def dsn_reject_controller(
+    get_controller: Callable[..., Controller]
+) -> Generator[Controller, None, None]:
+    handler = DsnRejectingHandler()
+    controller = get_controller(
+        handler,
+        decode_data=True,
+        enable_SMTPUTF8=True,
+        enable_DSN=True,
+    )
+    controller.start()
+    Global.set_addr_from(controller)
+    #
+    yield controller
+    #
+    controller.stop()
+
+
+@pytest.mark.usefixtures("dsn_controller")
+class TestDSN:
+    def test_ehlo_advertises_dsn(self, client):
+        code, mesg = client.ehlo("example.com")
+        assert code == 250
+        assert b"DSN" in mesg.splitlines()
+
+    def test_mail_ret_envid(self, dsn_controller, client):
+        client.ehlo("example.com")
+        resp = client.docmd("MAIL FROM: <anne@example.com> RET=FULL ENVID=abc123")
+        assert resp == S.S250_OK
+        assert client.docmd("RCPT TO: <bart@example.com>") == S.S250_OK
+        client.data(b"Subject: test\r\n\r\nbody")
+        envelope = dsn_controller.handler.box[0]
+        assert envelope.dsn_ret == "FULL"
+        assert envelope.dsn_envid == "abc123"
+
+    def test_mail_envid_xtext(self, dsn_controller, client):
+        client.ehlo("example.com")
+        resp = client.docmd("MAIL FROM: <anne@example.com> ENVID=hello+2Bworld+3d")
+        assert resp == S.S250_OK
+        assert client.docmd("RCPT TO: <bart@example.com>") == S.S250_OK
+        client.data(b"Subject: test\r\n\r\nbody")
+        envelope = dsn_controller.handler.box[0]
+        assert envelope.dsn_envid == "hello+world="
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "MAIL FROM: <anne@example.com> RET=FOO",
+            "MAIL FROM: <anne@example.com> RET",
+            "MAIL FROM: <anne@example.com> RET=FULL RET=HDRS",
+            "MAIL FROM: <anne@example.com> ENVID=foo=bar",
+            "MAIL FROM: <anne@example.com> ENVID=foo+2G",
+            "MAIL FROM: <anne@example.com> ENVID=a ENVID=b",
+        ],
+        ids=[
+            "ret_badvalue",
+            "ret_novalue",
+            "ret_duplicate",
+            "envid_equals",
+            "envid_badhex",
+            "envid_duplicate",
+        ],
+    )
+    def test_mail_dsn_param_error(self, client, command):
+        client.ehlo("example.com")
+        code, mesg = client.docmd(command)
+        assert code == 501
+        assert mesg.startswith(b"5.5.4")
+
+    def test_rcpt_notify_orcpt(self, dsn_controller, client):
+        client.ehlo("example.com")
+        assert client.docmd("MAIL FROM: <anne@example.com>") == S.S250_OK
+        resp = client.docmd(
+            "RCPT TO: <bart@example.com>"
+            " NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;bart+40example.com"
+        )
+        assert resp == S.S250_OK
+        client.data(b"Subject: test\r\n\r\nbody")
+        envelope = dsn_controller.handler.box[0]
+        assert envelope.rcpt_dsn_params == [
+            {"NOTIFY": ["SUCCESS", "FAILURE"], "ORCPT": "bart@example.com"}
+        ]
+
+    def test_rcpt_notify_never(self, dsn_controller, client):
+        client.ehlo("example.com")
+        assert client.docmd("MAIL FROM: <anne@example.com>") == S.S250_OK
+        resp = client.docmd("RCPT TO: <bart@example.com> NOTIFY=NEVER")
+        assert resp == S.S250_OK
+        client.data(b"Subject: test\r\n\r\nbody")
+        envelope = dsn_controller.handler.box[0]
+        assert envelope.rcpt_dsn_params == [
+            {"NOTIFY": ["NEVER"], "ORCPT": None}
+        ]
+
+    def test_rcpt_dsn_per_recipient(self, dsn_controller, client):
+        client.ehlo("example.com")
+        assert client.docmd("MAIL FROM: <anne@example.com>") == S.S250_OK
+        assert client.docmd(
+            "RCPT TO: <r1@example.com> NOTIFY=SUCCESS ORCPT=rfc822;r1+40example.com"
+        ) == S.S250_OK
+        assert client.docmd(
+            "RCPT TO: <r2@example.com> NOTIFY=NEVER"
+        ) == S.S250_OK
+        assert client.docmd("RCPT TO: <r3@example.com>") == S.S250_OK
+        client.data(b"Subject: test\r\n\r\nbody")
+        envelope = dsn_controller.handler.box[0]
+        assert envelope.rcpt_tos == [
+            "r1@example.com", "r2@example.com", "r3@example.com"
+        ]
+        assert envelope.rcpt_dsn_params == [
+            {"NOTIFY": ["SUCCESS"], "ORCPT": "r1@example.com"},
+            {"NOTIFY": ["NEVER"], "ORCPT": None},
+            {"NOTIFY": None, "ORCPT": None},
+        ]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "RCPT TO: <bart@example.com> NOTIFY=NEVER,FAILURE",
+            "RCPT TO: <bart@example.com> NOTIFY=SUCCESS,SUCCESS",
+            "RCPT TO: <bart@example.com> NOTIFY=BOGUS",
+            "RCPT TO: <bart@example.com> NOTIFY",
+            "RCPT TO: <bart@example.com> NOTIFY=SUCCESS NOTIFY=FAILURE",
+            "RCPT TO: <bart@example.com> ORCPT=foo;bart@example.com",
+            "RCPT TO: <bart@example.com> ORCPT=rfc822;bad+5Z",
+            "RCPT TO: <bart@example.com> ORCPT=rfc822",
+            "RCPT TO: <bart@example.com> ORCPT=rfc822;a ORCPT=rfc822;b",
+        ],
+        ids=[
+            "never_combined",
+            "duplicate_event",
+            "unknown_event",
+            "notify_novalue",
+            "notify_duplicate",
+            "orcpt_unknown_addrtype",
+            "orcpt_badxtext",
+            "orcpt_noaddress",
+            "orcpt_duplicate",
+        ],
+    )
+    def test_rcpt_dsn_param_error(self, client, command):
+        client.ehlo("example.com")
+        assert client.docmd("MAIL FROM: <anne@example.com>") == S.S250_OK
+        code, mesg = client.docmd(command)
+        assert code == 501
+        assert mesg.startswith(b"5.5.4")
+
+@pytest.mark.usefixtures("dsn_reject_controller")
+class TestDSNRejectedRcpt:
+    def test_rset_rejected_rcpt_no_metadata_leak(
+        self, dsn_reject_controller, client
+    ):
+        handler = dsn_reject_controller.handler
+        client.ehlo("example.com")
+        # First transaction, aborted with RSET
+        assert client.docmd(
+            "MAIL FROM: <anne@example.com> RET=FULL ENVID=first-envid"
+        ) == S.S250_OK
+        assert client.docmd(
+            "RCPT TO: <bart@example.com> NOTIFY=SUCCESS"
+        ) == S.S250_OK
+        assert client.docmd("RSET") == S.S250_OK
+        # Second transaction, with a rejected RCPT in the middle
+        assert client.docmd(
+            "MAIL FROM: <bob@example.com> RET=HDRS ENVID=second-envid"
+        ) == S.S250_OK
+        assert client.docmd(
+            "RCPT TO: <reject@example.com> NOTIFY=NEVER"
+        ) == (550, b"5.1.1 User unknown")
+        assert client.docmd(
+            "RCPT TO: <carol@example.com>"
+            " NOTIFY=FAILURE ORCPT=rfc822;carol+40example.com"
+        ) == S.S250_OK
+        client.data(b"Subject: one\r\n\r\nfirst")
+        # Third transaction, without any DSN parameters
+        assert client.docmd("MAIL FROM: <dave@example.com>") == S.S250_OK
+        assert client.docmd("RCPT TO: <erin@example.com>") == S.S250_OK
+        client.data(b"Subject: two\r\n\r\nsecond")
+        #
+        assert len(handler.box) == 2
+        env1, env2 = handler.box
+        assert env1.dsn_ret == "HDRS"
+        assert env1.dsn_envid == "second-envid"
+        assert env1.rcpt_tos == ["carol@example.com"]
+        assert env1.rcpt_dsn_params == [
+            {"NOTIFY": ["FAILURE"], "ORCPT": "carol@example.com"}
+        ]
+        assert env2.dsn_ret is None
+        assert env2.dsn_envid is None
+        assert env2.rcpt_tos == ["erin@example.com"]
+        assert env2.rcpt_dsn_params == [{"NOTIFY": None, "ORCPT": None}]
+
+
+@pytest.mark.usefixtures("plain_controller")
+class TestDSNDisabled:
+    def test_ehlo_no_dsn(self, client):
+        code, mesg = client.ehlo("example.com")
+        assert code == 250
+        assert b"DSN" not in mesg.splitlines()
+
+    def test_mail_dsn_params_unrecognized(self, client):
+        client.ehlo("example.com")
+        resp = client.docmd("MAIL FROM: <anne@example.com> RET=FULL")
+        assert resp == S.S555_MAIL_PARAMS_UNRECOG
+        resp = client.docmd("MAIL FROM: <anne@example.com> ENVID=abc")
+        assert resp == S.S555_MAIL_PARAMS_UNRECOG
+
+    def test_rcpt_dsn_params_unrecognized(self, client):
+        client.ehlo("example.com")
+        assert client.docmd("MAIL FROM: <anne@example.com>") == S.S250_OK
+        resp = client.docmd("RCPT TO: <bart@example.com> NOTIFY=NEVER")
+        assert resp == S.S555_RCPT_PARAMS_UNRECOG
+        resp = client.docmd("RCPT TO: <bart@example.com> ORCPT=rfc822;b@x.com")
+        assert resp == S.S555_RCPT_PARAMS_UNRECOG
