@@ -2062,3 +2062,275 @@ class TestSanitize:
         expect = "AuthResult(success=True, handled=True, message=None, auth_data=...)"
         assert repr(ar) == expect
         assert str(ar) == expect
+
+
+# region #### BDAT / CHUNKING Tests ##################################################
+
+
+def recv_smtp_reply(stream) -> bytes:
+    """Read a complete (possibly multiline) SMTP reply from a socket file."""
+    lines: List[bytes] = []
+    while True:
+        line = stream.readline()
+        assert line, "Connection closed while waiting for SMTP reply"
+        lines.append(line)
+        if line[3:4] == b" ":
+            return b"".join(lines)
+
+
+class BDATClient:
+    """Minimal raw-socket (E)SMTP client supporting fragmented sends."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.stream = sock.makefile("rb")
+        self.greeting = recv_smtp_reply(self.stream)
+
+    def cmd(self, command: bytes) -> bytes:
+        self.sock.sendall(command + BCRLF)
+        return recv_smtp_reply(self.stream)
+
+    def send_piecewise(self, data: bytes, size: int = 1) -> None:
+        """Send data in small fragments to simulate arbitrary TCP segmentation."""
+        for i in range(0, len(data), size):
+            self.sock.sendall(data[i:i + size])
+
+    def bdat(self, chunk: bytes, last: bool = False, frag: int = 0) -> bytes:
+        command = b"BDAT %d" % len(chunk) + (b" LAST" if last else b"")
+        if frag:
+            self.send_piecewise(command + BCRLF, frag)
+            self.send_piecewise(chunk, frag)
+        else:
+            self.sock.sendall(command + BCRLF + chunk)
+        return recv_smtp_reply(self.stream)
+
+    def close(self) -> None:
+        self.stream.close()
+        self.sock.close()
+
+
+BINARY_CONTENT = (
+    b"From: anne@example.com\r\n"
+    b"To: bart@example.com\r\n"
+    b"\r\n"
+    # NUL bytes, high bytes, and a bare LF
+    b"\x00\x01\x02\xff\xfe binary bytes\n"
+    # A bare CR not followed by LF
+    b"bare \r carriage return\n"
+    # Lines starting with dots (no dot-stuffing in BDAT)
+    b".line starting with a dot\r\n"
+    b"..line starting with two dots\r\n"
+    # Byte sequences that look like SMTP commands
+    b"RSET\r\n"
+    b"DATA\r\n"
+    # Would terminate a DATA phase
+    b"\r\n.\r\n"
+    # No trailing newline at all
+    b"trailing bytes without newline\x00"
+)
+
+
+@handler_data(class_=ReceivingHandler)
+class TestBDAT:
+    def make_client(self, controller) -> BDATClient:
+        sock = socket.create_connection((controller.hostname, controller.port))
+        return BDATClient(sock)
+
+    def mail_and_rcpt(self, client: BDATClient, mail: bytes = None) -> None:
+        if mail is None:
+            mail = b"MAIL FROM: <anne@example.com>"
+        assert client.cmd(mail).startswith(b"250")
+        assert client.cmd(b"RCPT TO: <bart@example.com>").startswith(b"250")
+
+    @controller_data(enable_CHUNKING=True)
+    def test_ehlo_offers_chunking(self, plain_controller):
+        client = self.make_client(plain_controller)
+        try:
+            reply = client.cmd(b"EHLO example.com")
+            assert b"250-CHUNKING" in reply
+            assert b"250-BINARYMIME" in reply
+        finally:
+            client.close()
+
+    def test_ehlo_no_chunking_by_default(self, plain_controller):
+        client = self.make_client(plain_controller)
+        try:
+            reply = client.cmd(b"EHLO example.com")
+            assert b"CHUNKING" not in reply
+            assert b"BINARYMIME" not in reply
+            assert client.cmd(b"BDAT 0 LAST").startswith(b"502")
+        finally:
+            client.close()
+
+    @controller_data(enable_CHUNKING=True)
+    def test_bdat_binary_roundtrip_fragmented(self, plain_controller):
+        handler = cast(ReceivingHandler, plain_controller.handler)
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            self.mail_and_rcpt(
+                client, b"MAIL FROM: <anne@example.com> BODY=BINARYMIME"
+            )
+            chunks = [
+                BINARY_CONTENT[:50],
+                BINARY_CONTENT[50:120],
+                BINARY_CONTENT[120:],
+            ]
+            for chunk in chunks[:-1]:
+                # Fragment both the BDAT command line and the chunk content;
+                # segmentation may happen at any position.
+                assert client.bdat(chunk, frag=3).startswith(b"250")
+            assert client.bdat(chunks[-1], last=True, frag=5).startswith(b"250")
+            # Content bytes resembling SMTP commands must not desynchronize
+            # the session.
+            assert client.cmd(b"NOOP").startswith(b"250")
+            assert client.cmd(b"QUIT").startswith(b"221")
+        finally:
+            client.close()
+        assert len(handler.box) == 1
+        envelope = handler.box[0]
+        assert envelope.mail_from == "anne@example.com"
+        assert envelope.rcpt_tos == ["bart@example.com"]
+        assert envelope.content == BINARY_CONTENT
+        assert envelope.original_content == BINARY_CONTENT
+
+    @controller_data(enable_CHUNKING=True)
+    def test_bdat_zero_length_chunks(self, plain_controller):
+        handler = cast(ReceivingHandler, plain_controller.handler)
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            self.mail_and_rcpt(client)
+            assert client.bdat(b"").startswith(b"250")
+            assert client.bdat(b"", last=True).startswith(b"250")
+        finally:
+            client.close()
+        assert len(handler.box) == 1
+        assert handler.box[0].content == b""
+
+    @controller_data(enable_CHUNKING=True, data_size_limit=100)
+    def test_bdat_size_limit_then_rset(self, plain_controller):
+        handler = cast(ReceivingHandler, plain_controller.handler)
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            self.mail_and_rcpt(client)
+            assert client.bdat(b"a" * 60).startswith(b"250")
+            # 60 + 50 exceeds the limit of 100; the chunk is still consumed
+            # so the session stays synchronized.
+            assert client.bdat(b"b" * 50).startswith(b"552")
+            assert handler.box == []
+            # RSET must recover the session after the failed BDAT.
+            assert client.cmd(b"RSET").startswith(b"250")
+            self.mail_and_rcpt(client)
+            assert client.bdat(b"x" * 10, last=True).startswith(b"250")
+            assert client.cmd(b"QUIT").startswith(b"221")
+        finally:
+            client.close()
+        assert len(handler.box) == 1
+        assert handler.box[0].content == b"x" * 10
+
+    @controller_data(enable_CHUNKING=True)
+    def test_bdat_disconnect_mid_chunk(self, plain_controller):
+        handler = cast(ReceivingHandler, plain_controller.handler)
+        client = self.make_client(plain_controller)
+        client.cmd(b"EHLO example.com")
+        self.mail_and_rcpt(client)
+        # Declare 100 bytes but vanish after sending only a few.
+        client.sock.sendall(b"BDAT 100\r\n" + b"partial")
+        client.sock.shutdown(socket.SHUT_WR)
+        client.close()
+        catchup_delay()
+        assert handler.box == []
+        # The server must still be able to serve a new connection.
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            self.mail_and_rcpt(client)
+            assert client.bdat(b"hello", last=True).startswith(b"250")
+        finally:
+            client.close()
+        assert len(handler.box) == 1
+        assert handler.box[0].content == b"hello"
+
+    @controller_data(enable_CHUNKING=True)
+    def test_bdat_needs_rcpt(self, plain_controller):
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            assert client.cmd(b"BDAT 0 LAST").startswith(b"503")
+            assert client.cmd(b"MAIL FROM: <anne@example.com>").startswith(b"250")
+            assert client.cmd(b"BDAT 0 LAST").startswith(b"503")
+        finally:
+            client.close()
+
+    @controller_data(enable_CHUNKING=True)
+    def test_bdat_bad_syntax(self, plain_controller):
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            self.mail_and_rcpt(client)
+            assert client.cmd(b"BDAT").startswith(b"501")
+            assert client.cmd(b"BDAT abc").startswith(b"501")
+            assert client.cmd(b"BDAT -1").startswith(b"501")
+            assert client.cmd(b"BDAT 10 FOO").startswith(b"501")
+            assert client.cmd(b"BDAT 1 2 3").startswith(b"501")
+            # None of the above consumed any content; session still usable.
+            assert client.bdat(b"ok", last=True).startswith(b"250")
+        finally:
+            client.close()
+
+    @controller_data(enable_CHUNKING=True)
+    def test_data_after_bdat_rejected(self, plain_controller):
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            self.mail_and_rcpt(client)
+            assert client.bdat(b"hello").startswith(b"250")
+            # DATA and BDAT must not be mixed in one transaction.
+            assert client.cmd(b"DATA").startswith(b"503")
+            # RSET clears the pending BDAT state; DATA works again.
+            assert client.cmd(b"RSET").startswith(b"250")
+            self.mail_and_rcpt(client)
+            assert client.cmd(b"DATA").startswith(b"354")
+            client.sock.sendall(b"via DATA\r\n.\r\n")
+            assert recv_smtp_reply(client.stream).startswith(b"250")
+        finally:
+            client.close()
+
+    @controller_data(enable_CHUNKING=True)
+    def test_binarymime_requires_bdat(self, plain_controller):
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            self.mail_and_rcpt(
+                client, b"MAIL FROM: <anne@example.com> BODY=BINARYMIME"
+            )
+            assert client.cmd(b"DATA").startswith(b"503")
+        finally:
+            client.close()
+
+    def test_binarymime_rejected_when_disabled(self, plain_controller):
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            reply = client.cmd(b"MAIL FROM: <anne@example.com> BODY=BINARYMIME")
+            assert reply.startswith(b"501")
+        finally:
+            client.close()
+
+    @controller_data(enable_CHUNKING=True)
+    def test_bdat_multiple_messages(self, plain_controller):
+        handler = cast(ReceivingHandler, plain_controller.handler)
+        client = self.make_client(plain_controller)
+        try:
+            client.cmd(b"EHLO example.com")
+            for i in range(3):
+                self.mail_and_rcpt(client)
+                content = b"message %d\x00\n" % i
+                assert client.bdat(content, last=True).startswith(b"250")
+        finally:
+            client.close()
+        assert [e.content for e in handler.box] == [
+            b"message %d\x00\n" % i for i in range(3)
+        ]

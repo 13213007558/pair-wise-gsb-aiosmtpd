@@ -7,6 +7,14 @@
 1.4.7 (aiosmtpd-next)
 =====================
 
+Added
+-----
+
+* Support the ``CHUNKING``/``BDAT`` and ``BINARYMIME`` ESMTP extensions
+  (:rfc:`3030`) via the new ``enable_CHUNKING`` parameter of the
+  ``SMTP`` class, allowing messages containing arbitrary binary bytes
+  to be received without DATA dot-stuffing or line length limits.
+
 Fixed/Improved
 --------------
 
