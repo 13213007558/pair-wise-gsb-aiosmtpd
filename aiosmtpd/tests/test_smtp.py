@@ -39,6 +39,7 @@ from aiosmtpd.smtp import (
     LoginPassword,
     Session as SMTPSession,
     __ident__ as GREETING,
+    _decode_xtext,
     auth_mechanism,
 )
 from aiosmtpd.testing.helpers import (
@@ -89,6 +90,17 @@ class ErrorSMTP(Server):
 
     async def smtp_HELO(self, hostname: str):
         raise self.exception_type("test")
+
+
+class DsnRejectingHandler(ReceivingHandler):
+    """Rejects RCPTs whose local part starts with 'reject'."""
+
+    async def handle_RCPT(
+        self, server, session, envelope, address, rcpt_options
+    ):
+        if address.startswith("reject"):
+            return "550 5.1.1 Recipient rejected"
+        return MISSING
 
 
 # endregion
@@ -461,6 +473,389 @@ class TestProtocol:
         assert responses[5] == S.S250_OK.to_bytes() + b"\r\n"
         assert len(handler.box) == 1
         assert handler.box[0].content == b""
+
+
+class TestXtextDecode:
+    @pytest.mark.parametrize(
+        "encoded,expected",
+        [
+            ("", ""),
+            ("plain", "plain"),
+            ("MyId+2B42", "MyId+42"),
+            ("a+3Db", "a=b"),
+            ("user+40example.com", "user@example.com"),
+            ("CaseSensitive", "CaseSensitive"),
+            ("+E9", "\xe9"),
+        ],
+    )
+    def test_valid(self, encoded, expected):
+        assert _decode_xtext(encoded) == expected
+
+    @pytest.mark.parametrize(
+        "encoded",
+        [
+            "ab+2",  # truncated hex escape
+            "ab+",  # dangling '+'
+            "ab+2G",  # not a hex digit
+            "ab+2b",  # hex digits must be uppercase (RFC 3461 s 4)
+            "a=b",  # '=' must be xtext-encoded
+            "sp ace",  # whitespace not allowed
+            "non\x7fascii",
+        ],
+    )
+    def test_invalid(self, encoded):
+        assert _decode_xtext(encoded) is None
+
+
+class TestDSN:
+    """Test the RFC 3461 DSN (Delivery Status Notification) extension."""
+
+    def _run_session(
+        self,
+        temp_event_loop,
+        get_protocol,
+        transport_resp,
+        handler,
+        commands,
+        **kwargs,
+    ):
+        protocol = get_protocol(handler, **kwargs)
+        protocol.data_received(BCRLF.join(commands) + BCRLF)
+        with suppress(asyncio.CancelledError):
+            temp_event_loop.run_until_complete(protocol._handler_coroutine)
+        _, responses = transport_resp
+        return protocol, responses
+
+    @staticmethod
+    def _codes(responses) -> List[bytes]:
+        return [response[:3] for response in responses]
+
+    def test_ehlo_advertises_dsn_when_enabled(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = ReceivingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [b"EHLO example.com", b"QUIT"],
+            enable_DSN=True,
+        )
+        assert b"250-DSN\r\n" in responses
+
+    def test_ehlo_does_not_advertise_dsn_by_default(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = ReceivingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [b"EHLO example.com", b"QUIT"],
+        )
+        assert b"250-DSN\r\n" not in responses
+
+    def test_dsn_params_rejected_when_disabled(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = ReceivingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [
+                b"EHLO example.com",
+                b"MAIL FROM: <anne@example.com> RET=FULL",
+                b"MAIL FROM: <anne@example.com>",
+                b"RCPT TO: <bart@example.com> NOTIFY=SUCCESS",
+                b"QUIT",
+            ],
+        )
+        assert (
+            b"555 MAIL FROM parameters not recognized or not implemented\r\n"
+            in responses
+        )
+        assert (
+            b"555 RCPT TO parameters not recognized or not implemented\r\n"
+            in responses
+        )
+
+    def test_mail_dsn_params_stored(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = ReceivingHandler()
+        self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [
+                b"EHLO example.com",
+                b"MAIL FROM: <anne@example.com> RET=HDRS ENVID=MyId+2B42",
+                b"RCPT TO: <bart@example.com>",
+                b"DATA",
+                b"Subject: test",
+                b"",
+                b"body",
+                b".",
+                b"QUIT",
+            ],
+            enable_DSN=True,
+        )
+        assert len(handler.box) == 1
+        envelope = handler.box[0]
+        assert envelope.dsn_ret == "HDRS"
+        assert envelope.dsn_envid == "MyId+42"
+
+    def test_mail_dsn_params_case_preserved(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = ReceivingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [
+                b"EHLO example.com",
+                b"MAIL FROM: <anne@example.com> ret=hdrs ENVID=MiXeD+3Dcase",
+                b"RCPT TO: <bart@example.com>",
+                b"DATA",
+                b"Subject: test",
+                b"",
+                b"body",
+                b".",
+                b"QUIT",
+            ],
+            enable_DSN=True,
+        )
+        assert b"501" not in self._codes(responses)
+        envelope = handler.box[0]
+        # Keywords are case-insensitive, xtext values are case-sensitive
+        assert envelope.dsn_ret == "HDRS"
+        assert envelope.dsn_envid == "MiXeD=case"
+
+    def test_rcpt_dsn_params_stored_per_recipient(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = ReceivingHandler()
+        self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [
+                b"EHLO example.com",
+                b"MAIL FROM: <anne@example.com>",
+                b"RCPT TO: <bart@example.com>"
+                b" NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;bart+40example.com",
+                b"RCPT TO: <cate@example.com> NOTIFY=NEVER",
+                b"RCPT TO: <dave@example.com>",
+                b"DATA",
+                b"Subject: test",
+                b"",
+                b"body",
+                b".",
+                b"QUIT",
+            ],
+            enable_DSN=True,
+        )
+        envelope = handler.box[0]
+        assert envelope.rcpt_tos == [
+            "bart@example.com",
+            "cate@example.com",
+            "dave@example.com",
+        ]
+        # Only recipients that carried DSN parameters have an entry
+        assert envelope.rcpt_dsn == {
+            "bart@example.com": {
+                "notify": ["SUCCESS", "FAILURE"],
+                "orcpt": ("rfc822", "bart@example.com"),
+            },
+            "cate@example.com": {
+                "notify": ["NEVER"],
+                "orcpt": None,
+            },
+        }
+
+    def test_rcpt_dsn_params_case_insensitive_keywords(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = ReceivingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [
+                b"EHLO example.com",
+                b"MAIL FROM: <anne@example.com>",
+                b"RCPT TO: <bart@example.com>"
+                b" notify=success orcpt=rfc822;Bart+40Example.com",
+                b"DATA",
+                b"Subject: test",
+                b"",
+                b"body",
+                b".",
+                b"QUIT",
+            ],
+            enable_DSN=True,
+        )
+        assert b"501" not in self._codes(responses)
+        envelope = handler.box[0]
+        # Keywords and event names are case-insensitive,
+        # but the xtext-encoded ORCPT address keeps its case
+        assert envelope.rcpt_dsn == {
+            "bart@example.com": {
+                "notify": ["SUCCESS"],
+                "orcpt": ("rfc822", "Bart@Example.com"),
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            b"MAIL FROM: <anne@example.com> RET=FULL RET=HDRS",
+            b"MAIL FROM: <anne@example.com> ret=full RET=hdrs",
+            b"MAIL FROM: <anne@example.com> RET=NOPE",
+            b"MAIL FROM: <anne@example.com> RET",
+            b"MAIL FROM: <anne@example.com> ENVID=ab+2G",
+            b"MAIL FROM: <anne@example.com> ENVID=ab+2",
+            b"MAIL FROM: <anne@example.com> ENVID=ab=cd",
+            b"MAIL FROM: <anne@example.com> ENVID",
+            b"MAIL FROM: <anne@example.com> ENVID=a ENVID=b",
+        ],
+    )
+    def test_bad_mail_dsn_params(
+        self, temp_event_loop, get_protocol, transport_resp, command
+    ):
+        handler = ReceivingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [b"EHLO example.com", command, b"DATA", b"QUIT"],
+            enable_DSN=True,
+        )
+        assert b"501" in self._codes(responses)
+        # The rejected MAIL must not have started a transaction
+        assert b"503" in self._codes(responses)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            b"RCPT TO: <bart@example.com> NOTIFY=NEVER,SUCCESS",
+            b"RCPT TO: <bart@example.com> NOTIFY=SUCCESS,NEVER",
+            b"RCPT TO: <bart@example.com> NOTIFY=FOO",
+            b"RCPT TO: <bart@example.com> NOTIFY=SUCCESS,FOO",
+            b"RCPT TO: <bart@example.com> NOTIFY=SUCCESS,",
+            b"RCPT TO: <bart@example.com> NOTIFY",
+            b"RCPT TO: <bart@example.com> NOTIFY=SUCCESS NOTIFY=FAILURE",
+            b"RCPT TO: <bart@example.com> ORCPT=nosemicolon",
+            b"RCPT TO: <bart@example.com> ORCPT=rfc822;bad+x",
+            b"RCPT TO: <bart@example.com> ORCPT=rfc822;bad+GH",
+            b"RCPT TO: <bart@example.com> ORCPT=;noaddrtype",
+            b"RCPT TO: <bart@example.com> ORCPT=rfc822;a ORCPT=rfc822;b",
+        ],
+    )
+    def test_bad_rcpt_dsn_params(
+        self, temp_event_loop, get_protocol, transport_resp, command
+    ):
+        handler = ReceivingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [
+                b"EHLO example.com",
+                b"MAIL FROM: <anne@example.com>",
+                command,
+                b"DATA",
+                b"QUIT",
+            ],
+            enable_DSN=True,
+        )
+        assert b"501" in self._codes(responses)
+        # The rejected RCPT must not have been recorded
+        assert b"503" in self._codes(responses)
+
+    def test_dsn_metadata_isolation_across_mails(
+        self, temp_event_loop, get_protocol, transport_resp
+    ):
+        handler = DsnRejectingHandler()
+        _, responses = self._run_session(
+            temp_event_loop,
+            get_protocol,
+            transport_resp,
+            handler,
+            [
+                b"EHLO example.com",
+                # First mail: one accepted DSN recipient, one rejected
+                b"MAIL FROM: <anne@example.com> ENVID=first+2Bmail RET=FULL",
+                b"RCPT TO: <keep1@example.com>"
+                b" NOTIFY=SUCCESS ORCPT=rfc822;keep1+40example.com",
+                b"RCPT TO: <reject1@example.com> NOTIFY=FAILURE",
+                b"DATA",
+                b"Subject: one",
+                b"",
+                b"body one",
+                b".",
+                b"RSET",
+                # Second mail: no DSN params at all
+                b"MAIL FROM: <bob@example.com>",
+                b"RCPT TO: <plain@example.com>",
+                b"DATA",
+                b"Subject: two",
+                b"",
+                b"body two",
+                b".",
+                # Third mail: DSN on MAIL and on a single RCPT
+                b"MAIL FROM: <carol@example.com> RET=HDRS",
+                b"RCPT TO: <keep2@example.com> NOTIFY=NEVER",
+                b"DATA",
+                b"Subject: three",
+                b"",
+                b"body three",
+                b".",
+                b"QUIT",
+            ],
+            enable_DSN=True,
+        )
+        assert b"550 5.1.1 Recipient rejected\r\n" in responses
+        assert len(handler.box) == 3
+        first, second, third = handler.box
+        # The rejected RCPT left no DSN metadata behind
+        assert first.mail_from == "anne@example.com"
+        assert first.dsn_envid == "first+mail"
+        assert first.dsn_ret == "FULL"
+        assert first.rcpt_tos == ["keep1@example.com"]
+        assert first.rcpt_dsn == {
+            "keep1@example.com": {
+                "notify": ["SUCCESS"],
+                "orcpt": ("rfc822", "keep1@example.com"),
+            },
+        }
+        # RSET and the new transaction cleared all previous DSN state
+        assert second.mail_from == "bob@example.com"
+        assert second.dsn_ret is None
+        assert second.dsn_envid is None
+        assert second.rcpt_tos == ["plain@example.com"]
+        assert second.rcpt_dsn == {}
+        # DSN metadata from the first mail did not leak into the third
+        assert third.mail_from == "carol@example.com"
+        assert third.dsn_ret == "HDRS"
+        assert third.dsn_envid is None
+        assert third.rcpt_dsn == {
+            "keep2@example.com": {
+                "notify": ["NEVER"],
+                "orcpt": None,
+            },
+        }
 
 
 @pytest.mark.usefixtures("plain_controller")

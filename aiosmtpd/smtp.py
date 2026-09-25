@@ -91,6 +91,9 @@ EMPTYBYTES = b''
 MISSING = _Missing.MISSING
 VALID_AUTHMECH = re.compile(r"[A-Z0-9_-]+\Z")
 
+DSN_NOTIFY_EVENTS = frozenset({"SUCCESS", "FAILURE", "DELAY"})
+"""Notification event keywords defined by RFC 3461 for the NOTIFY parameter"""
+
 # https://tools.ietf.org/html/rfc3207.html#page-3
 ALLOWED_BEFORE_STARTTLS = {"NOOP", "EHLO", "STARTTLS", "QUIT"}
 
@@ -204,6 +207,18 @@ class Envelope:
         self.original_content: Optional[bytes] = None
         self.rcpt_tos: List[str] = []
         self.rcpt_options: List[str] = []
+        self.dsn_ret: Optional[str] = None
+        """The RET parameter of MAIL FROM (RFC 3461): "FULL" or "HDRS"."""
+        self.dsn_envid: Optional[str] = None
+        """The xtext-decoded ENVID parameter of MAIL FROM (RFC 3461)."""
+        self.rcpt_dsn: Dict[str, Dict[str, Any]] = {}
+        """
+        Per-recipient DSN parameters (RFC 3461), keyed by recipient address.
+        Only recipients accepted with NOTIFY and/or ORCPT parameters have an
+        entry here; each entry is a dict with the keys "notify" (a list of
+        notification events, or ["NEVER"]) and "orcpt" (a tuple of
+        (addr-type, xtext-decoded original recipient address)).
+        """
 
 
 # This is here to enable debugging output when the -E option is given to the
@@ -288,6 +303,34 @@ def sanitized_log(func: Callable[..., None], msg: AnyStr, *args, **kwargs) -> No
     func(msg, *sanitized_args, **kwargs)
 
 
+XTEXT_HEXDIGITS = frozenset("0123456789ABCDEF")
+
+
+def _decode_xtext(value: str) -> Optional[str]:
+    """
+    Decode an RFC 3461 xtext-encoded string.
+
+    Returns the decoded string, or None if *value* is not valid xtext.
+    """
+    result: List[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "+":
+            hexdigits = value[index + 1:index + 3]
+            if len(hexdigits) != 2 or any(
+                    digit not in XTEXT_HEXDIGITS for digit in hexdigits):
+                return None
+            result.append(chr(int(hexdigits, 16)))
+            index += 3
+        elif "!" <= char <= "~" and char != "=":
+            result.append(char)
+            index += 1
+        else:
+            return None
+    return "".join(result)
+
+
 @public
 class SMTP(asyncio.StreamReaderProtocol):
     """
@@ -319,6 +362,7 @@ class SMTP(asyncio.StreamReaderProtocol):
             *,
             data_size_limit: Optional[int] = DATA_SIZE_DEFAULT,
             enable_SMTPUTF8: bool = False,
+            enable_DSN: bool = False,
             decode_data: bool = False,
             hostname: Optional[str] = None,
             ident: Optional[str] = None,
@@ -344,6 +388,7 @@ class SMTP(asyncio.StreamReaderProtocol):
         assert data_size_limit is None or isinstance(data_size_limit, int)
         self.data_size_limit = data_size_limit
         self.enable_SMTPUTF8 = enable_SMTPUTF8
+        self.enable_DSN = enable_DSN
         self._decode_data = decode_data
         self.command_size_limits.clear()
         if hostname:
@@ -854,6 +899,12 @@ class SMTP(asyncio.StreamReaderProtocol):
         if self.enable_SMTPUTF8:
             response.append('250-SMTPUTF8')
             self.command_size_limits['MAIL'] += 10
+        if self.enable_DSN:
+            response.append('250-DSN')
+            # RFC 3461 s 5.4: DSN parameters can make MAIL FROM and RCPT TO
+            # commands up to 116 and 526 octets longer, respectively.
+            self.command_size_limits['MAIL'] += 116
+            self.command_size_limits['RCPT'] += 526
         if self.tls_context and not self._tls_protocol:
             response.append('250-STARTTLS')
         if not self._auth_require_tls or self._tls_protocol:
@@ -1218,6 +1269,30 @@ class SMTP(asyncio.StreamReaderProtocol):
             result[param] = value if eq else True
         return result
 
+    def _parse_dsn_params(
+            self, raw_options: Sequence[str], allowed: Sequence[str]
+    ) -> Union[Dict[str, str], str]:
+        """
+        Extract DSN parameters from case-preserved ESMTP option tokens.
+
+        Parameter keywords are matched case-insensitively, but values keep
+        their original case (they may be xtext-encoded). Returns a dict of
+        keyword -> value, or an error message if a parameter is duplicated
+        or carries no value.
+        """
+        result: Dict[str, str] = {}
+        for option in raw_options:
+            keyword, eq, value = option.partition('=')
+            keyword = keyword.upper()
+            if keyword not in allowed:
+                continue
+            if keyword in result:
+                return '501 Error: duplicate {} parameter'.format(keyword)
+            if not eq or not value:
+                return '501 Error: {} requires a value'.format(keyword)
+            result[keyword] = value
+        return result
+
     # noinspection PyUnresolvedReferences
     def _syntax_available(self, method: Callable) -> bool:
         if not hasattr(method, '__smtp_syntax__'):
@@ -1328,6 +1403,32 @@ class SMTP(asyncio.StreamReaderProtocol):
                     '552 Error: message size exceeds fixed maximum message '
                     'size')
                 return
+        dsn_ret: Optional[str] = None
+        dsn_envid: Optional[str] = None
+        if self.enable_DSN:
+            # Values must be parsed from the case-preserved options because
+            # ENVID is xtext-encoded (RFC 3461 s 4.1).
+            dsn_params = self._parse_dsn_params(
+                addrparams.split(), ('RET', 'ENVID'))
+            if isinstance(dsn_params, str):
+                await self.push(dsn_params)
+                return
+            params.pop('RET', None)
+            params.pop('ENVID', None)
+            ret = dsn_params.get('RET')
+            if ret is not None:
+                if ret.upper() not in ('FULL', 'HDRS'):
+                    await self.push(
+                        '501 Error: RET parameter must be FULL or HDRS')
+                    return
+                dsn_ret = ret.upper()
+            envid = dsn_params.get('ENVID')
+            if envid is not None:
+                dsn_envid = _decode_xtext(envid)
+                if dsn_envid is None:
+                    await self.push(
+                        '501 Error: malformed ENVID parameter')
+                    return
         if len(params) > 0:
             await self.push(
                 '555 MAIL FROM parameters not recognized or not implemented')
@@ -1336,6 +1437,8 @@ class SMTP(asyncio.StreamReaderProtocol):
         if status is MISSING:
             self.envelope.mail_from = address
             self.envelope.mail_options.extend(mail_options)
+            self.envelope.dsn_ret = dsn_ret
+            self.envelope.dsn_envid = dsn_envid
             status = '250 OK'
         log.info('%r sender: %s', self.session.peer, address)
         await self.push(status)
@@ -1378,7 +1481,37 @@ class SMTP(asyncio.StreamReaderProtocol):
         if params_dict is None:
             await self.push(syntaxerr)
             return
-        # XXX currently there are no options we recognize.
+        dsn_notify: Optional[List[str]] = None
+        dsn_orcpt: Optional[Tuple[str, str]] = None
+        if self.enable_DSN:
+            # Values must be parsed from the case-preserved options because
+            # ORCPT is xtext-encoded (RFC 3461 s 4.2).
+            dsn_params = self._parse_dsn_params(
+                params.split(), ('NOTIFY', 'ORCPT'))
+            if isinstance(dsn_params, str):
+                await self.push(dsn_params)
+                return
+            params_dict.pop('NOTIFY', None)
+            params_dict.pop('ORCPT', None)
+            notify = dsn_params.get('NOTIFY')
+            if notify is not None:
+                events = notify.upper().split(',')
+                # NEVER is only valid on its own (RFC 3461 s 4.1).
+                if events != ['NEVER'] and not all(
+                        event in DSN_NOTIFY_EVENTS for event in events):
+                    await self.push(
+                        '501 Error: malformed NOTIFY parameter')
+                    return
+                dsn_notify = events
+            orcpt = dsn_params.get('ORCPT')
+            if orcpt is not None:
+                addr_type, semi, orcpt_addr = orcpt.partition(';')
+                decoded_orcpt = _decode_xtext(orcpt_addr) if semi else None
+                if not semi or not addr_type.isalnum() or decoded_orcpt is None:
+                    await self.push(
+                        '501 Error: malformed ORCPT parameter')
+                    return
+                dsn_orcpt = (addr_type, decoded_orcpt)
         if len(params_dict) > 0:
             await self.push(
                 '555 RCPT TO parameters not recognized or not implemented'
@@ -1389,6 +1522,13 @@ class SMTP(asyncio.StreamReaderProtocol):
         if status is MISSING:
             self.envelope.rcpt_tos.append(address)
             self.envelope.rcpt_options.extend(rcpt_options)
+            if dsn_notify is not None or dsn_orcpt is not None:
+                # Only record DSN metadata for accepted recipients, keyed by
+                # address, so rejected RCPTs cannot leave misaligned entries.
+                self.envelope.rcpt_dsn[address] = {
+                    'notify': dsn_notify,
+                    'orcpt': dsn_orcpt,
+                }
             status = '250 OK'
         log.info('%r recip: %s', self.session.peer, address)
         await self.push(status)

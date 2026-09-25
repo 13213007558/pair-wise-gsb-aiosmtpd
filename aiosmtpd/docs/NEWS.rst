@@ -13,6 +13,17 @@ Fixed/Improved
 * Dropped Python 3.8, PyPy 3.8
 * Added PyPy 3.11, dropped PyPy 3.9
 
+Added
+-----
+
+* Optional support for the DSN (Delivery Status Notification) extension
+  defined in :rfc:`3461`, enabled via the new ``enable_DSN``
+  parameter of the ``SMTP`` class. When enabled, the server advertises
+  ``DSN`` in the ``EHLO`` response and parses the ``RET``/``ENVID``
+  ``MAIL FROM`` parameters and the ``NOTIFY``/``ORCPT`` ``RCPT TO``
+  parameters, exposing them on the envelope as ``dsn_ret``,
+  ``dsn_envid``, and ``rcpt_dsn``.
+
 
 1.4.6 (2024-05-18)
 ==================

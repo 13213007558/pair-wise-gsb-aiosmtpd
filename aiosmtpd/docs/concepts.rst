@@ -163,6 +163,32 @@ completed, or in certain error conditions as mandated by :rfc:`5321`.
       any recipient options provided by the client, such as those passed in by
       :meth:`smtplib.SMTP.sendmail`
 
+   .. attribute:: dsn_ret
+      :type: Optional[str]
+
+      Defaulting to None, this attribute holds the value of the ``RET``
+      parameter of the ``MAIL FROM`` command (``FULL`` or ``HDRS``),
+      when the DSN extension (:rfc:`3461`) is enabled and the client
+      provided the parameter.
+
+   .. attribute:: dsn_envid
+      :type: Optional[str]
+
+      Defaulting to None, this attribute holds the xtext-decoded value of the
+      ``ENVID`` parameter of the ``MAIL FROM`` command, when the DSN
+      extension is enabled and the client provided the parameter.
+
+   .. attribute:: rcpt_dsn
+      :type: Dict[str, Dict[str, Any]]
+
+      Defaulting to the empty dict, this attribute holds the per-recipient DSN
+      parameters, keyed by recipient address. Only recipients accepted with
+      ``NOTIFY`` and/or ``ORCPT`` parameters have an entry; each entry is
+      a dict with the keys ``notify`` (a list of notification events, or
+      ``["NEVER"]``) and ``orcpt`` (a ``(addr-type, address)`` tuple with
+      the xtext-decoded original recipient address). Either value may be None
+      if the client did not provide the corresponding parameter.
+
 
 .. _peername: https://docs.python.org/3/library/asyncio-protocol.html?highlight=peername#asyncio.BaseTransport.get_extra_info
 .. |peername| replace:: ``peername``
