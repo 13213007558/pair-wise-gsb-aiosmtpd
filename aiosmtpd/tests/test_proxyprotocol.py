@@ -25,10 +25,13 @@ from aiosmtpd.proxy_protocol import (
     PROTO,
     V2_SIGNATURE,
     AsyncReader,
+    CRC32CPolicy,
+    CRC32CStatus,
     MalformedTLV,
     ProxyData,
     ProxyTLV,
     UnknownTypeTLV,
+    crc32c,
     get_proxy,
 )
 from aiosmtpd.smtp import SMTP as SMTPServer
@@ -132,7 +135,6 @@ def setup_proxy_protocol(
         kwargs["proxy_protocol_timeout"] = proxy_timeout
         protocol = SMTPServer(handler, *args, **kwargs)
         protocol.connection_made(transport)
-
         def runner(stop_after: float = DEFAULT_AUTOCANCEL):
             loop.call_later(stop_after, protocol._handler_coroutine.cancel)
             with suppress(asyncio.CancelledError):
@@ -141,6 +143,7 @@ def setup_proxy_protocol(
         test_obj.protocol = protocol
         test_obj.runner = runner
         test_obj.transport = transport
+        test_obj.responses = responses
 
     return getter
 
@@ -149,6 +152,7 @@ class _TestProxyProtocolCommon:
     protocol: SMTPServer = None
     runner = None
     transport = None
+    responses: List[bytes] = None
 
 
 class TestProxyData:
@@ -355,6 +359,323 @@ class TestProxyTLV:
         ptlv2 = ProxyTLV.from_raw(data2)
         assert ptlv1 is not ptlv2
         assert ptlv1 == ptlv2
+
+
+def _crc32c_bitwise(data: bytes) -> int:
+    """
+    Independent, deliberately simple per-bit CRC32C (Castagnoli) reference.
+
+    Uses no lookup table and a different code path from crc32c(), so agreement
+    between the two is meaningful rather than self-referential.
+    """
+    crc = 0xFFFFFFFF
+    for octet in data:
+        crc ^= octet
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x82F63B78
+            else:
+                crc >>= 1
+    return crc ^ 0xFFFFFFFF
+
+
+# Fixed public CRC32C vectors (RFC 3720 Appendix B.2 and the Castagnoli check
+# value for the ASCII string "123456789").
+CRC32C_PUBLIC_VECTORS = [
+    (b"", 0x00000000),
+    (b"123456789", 0xE3069283),
+    (bytes(32), 0x8A9136AA),
+    (b"\xFF" * 32, 0x62A8AB43),
+    (bytes(range(32)), 0x46DD794E),
+    (bytes(range(31, -1, -1)), 0x113FDB5C),
+]
+
+
+class TestCRC32C:
+    @parametrize("data, expected", CRC32C_PUBLIC_VECTORS)
+    def test_public_vectors(self, data: bytes, expected: int):
+        assert crc32c(data) == expected
+
+    @parametrize("length", [0, 1, 2, 3, 4, 7, 15, 16, 31, 64, 257])
+    def test_matches_bitwise_reference(self, length: int):
+        # Deterministic pseudo-random payload, not random: keeps the vector fixed.
+        data = bytes((index * 137 + 29) & 0xFF for index in range(length))
+        assert crc32c(data) == _crc32c_bitwise(data)
+
+    def test_accepts_all_bytes_likes(self):
+        assert crc32c(bytearray(b"abc")) == crc32c(b"abc")
+        assert crc32c(memoryview(b"abc")) == crc32c(b"abc")
+
+    def test_different_inputs_differ(self):
+        assert crc32c(b"abc") != crc32c(b"abd")
+
+
+def build_v2_frame(
+    tlv_bytes: bytes = b"",
+    *,
+    command: V2_CMD = V2_CMD.PROXY,
+    family: AF = AF.INET,
+    proto: PROTO = PROTO.STREAM,
+    address_block: Optional[bytes] = None,
+) -> bytearray:
+    """Assemble a PROXYv2 frame; tlv_bytes is the raw top-level TLV region."""
+    if address_block is None:
+        address_block = (
+            IPv4Address("1.2.3.4").packed
+            + IPv4Address("5.6.7.8").packed
+            + (45138).to_bytes(2, "big")
+            + (25253).to_bytes(2, "big")
+        )
+    payload = address_block + tlv_bytes
+    ver_cmd = 0x20 | command.value
+    header = (
+        V2_SIGNATURE
+        + bytes([ver_cmd, (family << 4) | proto])
+        + len(payload).to_bytes(2, "big")
+    )
+    return bytearray(header + payload)
+
+
+def insert_crc32c(frame: bytearray, crc_value_offset: int) -> bytearray:
+    """
+    Compute the CRC32C over the frame with the 4-octet value at
+    crc_value_offset zeroed, then write the checksum into the frame.
+    """
+    frame[crc_value_offset : crc_value_offset + 4] = b"\x00" * 4
+    checksum = crc32c(frame)
+    frame[crc_value_offset : crc_value_offset + 4] = checksum.to_bytes(4, "big")
+    return frame
+
+
+def crc32c_tlv(value: bytes = b"\x00" * 4) -> bytes:
+    return b"\x03" + len(value).to_bytes(2, "big") + value
+
+
+class MockAsyncReader(AsyncReader):
+    def __init__(self, data, timeout=0.4):
+        self.data = bytearray(data)
+        self.timeout = 0.4
+
+    async def read(self, num_bytes: Optional[int] = None) -> bytes:
+        emit = self.data[0:num_bytes]
+        del self.data[0:num_bytes]
+        return emit
+
+    async def readexactly(self, n: int) -> bytes:
+        emit = self.data[0:n]
+        del self.data[0:n]
+        if len(emit) < n:
+            await asyncio.sleep(self.timeout)
+        return emit
+
+    async def readuntil(self, until_chars: Optional[bytes] = None) -> bytes:
+        if until_chars is None:
+            until_chars = b"\n"
+        emit = bytearray()
+        _count = 0
+        for _count, char in enumerate(self.data, start=1):
+            emit += char.to_bytes(1, "big")
+            if char in until_chars:
+                break
+        del self.data[0:_count]
+        return emit
+
+
+class ChunkedStreamReader:
+    """
+    Drives a real asyncio.StreamReader by feeding the input in fixed-size
+    chunks, reproducing fragmented TCP delivery without any test-double
+    read() semantics.
+    """
+
+    def __init__(self, data: bytes, chunk_size: int = 3):
+        self.chunk_size = chunk_size
+        self.stream = asyncio.StreamReader()
+        for index in range(0, len(data), chunk_size):
+            self.stream.feed_data(data[index : index + chunk_size])
+        self.stream.feed_eof()
+
+    def __getattr__(self, item: str):
+        return getattr(self.stream, item)
+
+
+class TestChecksumVerification:
+    def _get(self, loop, frame: bytes, policy: CRC32CPolicy, reader_cls=None):
+        reader_cls = reader_cls or MockAsyncReader
+        mock_reader = reader_cls(frame)
+        return loop.run_until_complete(get_proxy(mock_reader, policy))
+
+    def test_valid_frame_all_policies(self, temp_event_loop):
+        frame = build_v2_frame(crc32c_tlv())
+        insert_crc32c(frame, 16 + 12 + 3)
+        for policy in CRC32CPolicy:
+            pd = self._get(temp_event_loop, bytes(frame), policy)
+            assert pd.valid
+            if policy is CRC32CPolicy.IGNORE:
+                assert pd.checksum_status is CRC32CStatus.NOT_PROVIDED
+            else:
+                assert pd.checksum_status is CRC32CStatus.VALID
+            assert pd.error == ""
+
+    def test_missing_checksum_never_reported_valid(self, temp_event_loop):
+        frame = build_v2_frame(b"\x02\x00\tAUTHORITY")
+        pd_ignore = self._get(
+            temp_event_loop, bytes(frame), CRC32CPolicy.IGNORE
+        )
+        assert pd_ignore.valid
+        assert pd_ignore.checksum_status is CRC32CStatus.NOT_PROVIDED
+        pd_optional = self._get(
+            temp_event_loop, bytes(frame), CRC32CPolicy.OPTIONAL
+        )
+        assert pd_optional.valid
+        assert pd_optional.checksum_status is CRC32CStatus.NOT_PROVIDED
+        assert pd_optional.error == ""
+        pd_required = self._get(
+            temp_event_loop, bytes(frame), CRC32CPolicy.REQUIRED
+        )
+        assert not pd_required.valid
+        assert pd_required.checksum_status is CRC32CStatus.NOT_PROVIDED
+        assert pd_required.error == "PROXYv2 CRC32C TLV vector not provided"
+
+    def test_mismatch_is_invalid(self, temp_event_loop):
+        frame = build_v2_frame(crc32c_tlv())
+        insert_crc32c(frame, 16 + 12 + 3)
+        frame[20] ^= 0xFF
+        for policy in (CRC32CPolicy.OPTIONAL, CRC32CPolicy.REQUIRED):
+            pd = self._get(temp_event_loop, bytes(frame), policy)
+            assert not pd.valid
+            assert pd.checksum_status is CRC32CStatus.INVALID
+            assert pd.error == "PROXYv2 CRC32C checksum mismatch"
+
+    def test_duplicate_crc_tlv(self, temp_event_loop):
+        frame = build_v2_frame(crc32c_tlv() + crc32c_tlv(b"\x11" * 4))
+        insert_crc32c(frame, 16 + 12 + 3)
+        pd = self._get(temp_event_loop, bytes(frame), CRC32CPolicy.OPTIONAL)
+        assert not pd.valid
+        assert pd.checksum_status is CRC32CStatus.INVALID
+        assert pd.error == "PROXYv2 duplicate CRC32C TLV vector"
+
+    def test_crc_tlv_wrong_length(self, temp_event_loop):
+        frame = build_v2_frame(b"\x03\x00\x03\x00\x00\x00")
+        pd = self._get(temp_event_loop, bytes(frame), CRC32CPolicy.OPTIONAL)
+        assert not pd.valid
+        assert pd.checksum_status is CRC32CStatus.INVALID
+        assert pd.error == "PROXYv2 CRC32C TLV vector has wrong length"
+
+    def test_tlv_length_exceeds_header(self, temp_event_loop):
+        # NOOP TLV declares 16 value octets but only 5 are present.
+        frame = build_v2_frame(b"\x04\x00\x10short")
+        pd = self._get(temp_event_loop, bytes(frame), CRC32CPolicy.OPTIONAL)
+        assert not pd.valid
+        assert pd.checksum_status is CRC32CStatus.INVALID
+        assert pd.error == "PROXYv2 TLV vector length exceeds header"
+
+    def test_truncated_tlv_header(self, temp_event_loop):
+        frame = build_v2_frame(b"\x04\x00")
+        pd = self._get(temp_event_loop, bytes(frame), CRC32CPolicy.REQUIRED)
+        assert not pd.valid
+        assert pd.checksum_status is CRC32CStatus.INVALID
+        assert pd.error == "PROXYv2 truncated TLV vector"
+
+    def test_nested_ssl_offsets_do_not_change_range(self, temp_event_loop):
+        subvectors = b"\x21\x00\x07TLSv1.3%\x00\x07RSA4096"
+        ssl_tlv = (
+            b"\x20"
+            + (5 + len(subvectors)).to_bytes(2, "big")
+            + b"\x01\x00\x00\x00\x00"
+            + subvectors
+        )
+        frame = build_v2_frame(ssl_tlv + crc32c_tlv())
+        crc_offset = 16 + 12 + len(ssl_tlv) + 3
+        insert_crc32c(frame, crc_offset)
+        pd = self._get(temp_event_loop, bytes(frame), CRC32CPolicy.REQUIRED)
+        assert pd.valid
+        assert pd.checksum_status is CRC32CStatus.VALID
+        assert pd.tlv.SSL is True
+        # Corrupting an octet inside the nested SSL TLV must invalidate the
+        # outer checksum, proving the nested region is inside the CRC range.
+        corrupted = bytearray(frame)
+        corrupted[16 + 12 + 5] ^= 0x01
+        pd_bad = self._get(
+            temp_event_loop, bytes(corrupted), CRC32CPolicy.REQUIRED
+        )
+        assert not pd_bad.valid
+        assert pd_bad.checksum_status is CRC32CStatus.INVALID
+        assert pd_bad.error == "PROXYv2 CRC32C checksum mismatch"
+
+    def test_unspec_family_crc(self, temp_event_loop):
+        payload = crc32c_tlv()
+        frame = bytearray(
+            V2_SIGNATURE
+            + bytes([0x20, 0x00])
+            + len(payload).to_bytes(2, "big")
+            + payload
+        )
+        insert_crc32c(frame, 16 + 3)
+        pd = self._get(temp_event_loop, bytes(frame), CRC32CPolicy.REQUIRED)
+        assert pd.valid
+        assert pd.checksum_status is CRC32CStatus.VALID
+        assert pd.tlv_start is None
+
+    def test_whole_raw_left_unmodified(self, temp_event_loop):
+        frame = build_v2_frame(crc32c_tlv())
+        insert_crc32c(frame, 16 + 12 + 3)
+        original = bytes(frame)
+        pd = self._get(temp_event_loop, original, CRC32CPolicy.OPTIONAL)
+        assert bytes(pd.whole_raw) == original
+
+    @parametrize("chunk_size", [1, 2, 3, 7])
+    def test_byte_by_byte_framing(self, temp_event_loop, chunk_size):
+        frame = build_v2_frame(b"\x02\x00\tAUTHORITY" + crc32c_tlv())
+        insert_crc32c(frame, 16 + 12 + 12 + 3)
+        reader = ChunkedStreamReader(bytes(frame), chunk_size=chunk_size)
+        pd = temp_event_loop.run_until_complete(
+            get_proxy(reader, CRC32CPolicy.REQUIRED)
+        )
+        assert pd.valid
+        assert pd.checksum_status is CRC32CStatus.VALID
+
+    def test_trailing_smtp_bytes_not_consumed(self, temp_event_loop):
+        frame = build_v2_frame(crc32c_tlv())
+        insert_crc32c(frame, 16 + 12 + 3)
+        trailing = b"EHLO example.org\r\n"
+        mock_reader = MockAsyncReader(bytes(frame) + trailing)
+        pd = temp_event_loop.run_until_complete(
+            get_proxy(mock_reader, CRC32CPolicy.OPTIONAL)
+        )
+        assert pd.valid
+        assert bytes(mock_reader.data) == trailing
+
+    def test_v1_ignores_policy(self, temp_event_loop):
+        mock_reader = MockAsyncReader(GOOD_V1_HANDSHAKE)
+        pd = temp_event_loop.run_until_complete(
+            get_proxy(mock_reader, CRC32CPolicy.REQUIRED)
+        )
+        assert pd.valid
+        assert pd.checksum_status is CRC32CStatus.NOT_PROVIDED
+
+
+class TestChecksumSMTPInit:
+    def test_default_is_ignore(self, temp_event_loop):
+        server = SMTPServer(Sink(), loop=temp_event_loop)
+        assert server._proxy_checksum_policy is CRC32CPolicy.IGNORE
+
+    @parametrize("policy", list(CRC32CPolicy))
+    def test_accepts_policy(self, temp_event_loop, policy):
+        server = SMTPServer(
+            Sink(),
+            proxy_protocol_checksum_policy=policy,
+            loop=temp_event_loop,
+        )
+        assert server._proxy_checksum_policy is policy
+
+    def test_rejects_wrong_type(self, temp_event_loop):
+        with pytest.raises(TypeError, match=r"CRC32CPolicy member"):
+            SMTPServer(
+                Sink(),
+                proxy_protocol_checksum_policy="required",  # type: ignore[arg-type]
+                loop=temp_event_loop,
+            )
 
 
 class TestModule:
@@ -948,6 +1269,128 @@ class TestGetV2(_TestProxyProtocolCommon):
         self._send_invalid(
             fam=2, proto=1, payload=payload, expect="PROXYv2 truncated address"
         )
+
+    def _checksummed_frame(self, tlv_bytes: bytes = b"") -> bytes:
+        frame = build_v2_frame(tlv_bytes + crc32c_tlv())
+        crc_offset = 16 + 12 + len(tlv_bytes) + 3
+        insert_crc32c(frame, crc_offset)
+        return bytes(frame)
+
+    def test_required_policy_rejects_failed_preamble(self, setup_proxy_protocol):
+        setup_proxy_protocol(
+            self, proxy_protocol_checksum_policy=CRC32CPolicy.REQUIRED
+        )
+        frame = bytearray(self._checksummed_frame())
+        frame[20] ^= 0xFF
+        self.protocol.data_received(bytes(frame))
+        self.runner()
+        handler: ProxyPeekerHandler = self.protocol.event_handler
+        # The failed preamble must never reach handle_PROXY, and the SMTP
+        # greeting must never be sent: the connection stops at the preamble.
+        assert not handler.called
+        proxy_data = self.protocol.session.proxy_data
+        assert not proxy_data.valid
+        assert proxy_data.checksum_status is CRC32CStatus.INVALID
+        assert self.transport.close.called
+        assert not b"".join(self.responses).startswith(b"220 ")
+
+    def test_required_policy_accepts_good_preamble(self, setup_proxy_protocol):
+        setup_proxy_protocol(
+            self, proxy_protocol_checksum_policy=CRC32CPolicy.REQUIRED
+        )
+        frame = self._checksummed_frame(b"\x02\x00\tAUTHORITY")
+        self.protocol.data_received(frame)
+        self.runner(0.5)
+        handler = self.protocol.event_handler
+        assert handler.called
+        proxy_data = handler.proxy_datas[-1]
+        assert proxy_data.valid
+        assert proxy_data.checksum_status is CRC32CStatus.VALID
+        # A good preamble enters the SMTP state machine and emits the greeting.
+        assert b"".join(self.responses).startswith(b"220 ")
+
+    def test_required_policy_rejects_missing_checksum(self, setup_proxy_protocol):
+        setup_proxy_protocol(
+            self, proxy_protocol_checksum_policy=CRC32CPolicy.REQUIRED
+        )
+        frame = bytes(build_v2_frame(b"\x02\x00\tAUTHORITY"))
+        self.protocol.data_received(frame)
+        self.runner()
+        handler = self.protocol.event_handler
+        assert not handler.called
+        proxy_data = self.protocol.session.proxy_data
+        assert not proxy_data.valid
+        assert proxy_data.checksum_status is CRC32CStatus.NOT_PROVIDED
+        assert not b"".join(self.responses).startswith(b"220 ")
+
+    def test_optional_policy_allows_missing_checksum(self, setup_proxy_protocol):
+        setup_proxy_protocol(
+            self, proxy_protocol_checksum_policy=CRC32CPolicy.OPTIONAL
+        )
+        frame = bytes(build_v2_frame(b"\x02\x00\tAUTHORITY"))
+        self.protocol.data_received(frame)
+        self.runner(0.5)
+        handler = self.protocol.event_handler
+        assert handler.called
+        proxy_data = handler.proxy_datas[-1]
+        assert proxy_data.valid
+        # Absence must be distinguishable from a verified checksum, and the
+        # connection must still proceed into the SMTP state machine.
+        assert proxy_data.checksum_status is CRC32CStatus.NOT_PROVIDED
+        assert b"".join(self.responses).startswith(b"220 ")
+
+    def test_optional_policy_rejects_bad_checksum(self, setup_proxy_protocol):
+        setup_proxy_protocol(
+            self, proxy_protocol_checksum_policy=CRC32CPolicy.OPTIONAL
+        )
+        frame = bytearray(self._checksummed_frame())
+        frame[20] ^= 0xFF
+        self.protocol.data_received(bytes(frame))
+        self.runner()
+        handler = self.protocol.event_handler
+        assert not handler.called
+        assert self.protocol.session.proxy_data.checksum_status is (
+            CRC32CStatus.INVALID
+        )
+        assert not b"".join(self.responses).startswith(b"220 ")
+
+    def test_smtp_trailing_bytes_enter_smtp_state_machine(
+        self, setup_proxy_protocol
+    ):
+        setup_proxy_protocol(
+            self, proxy_protocol_checksum_policy=CRC32CPolicy.REQUIRED
+        )
+        frame = self._checksummed_frame()
+        # SMTP bytes arriving in the same TCP segment must not be swallowed by
+        # the preamble parser; the SMTP loop must consume the full command line.
+        self.protocol.data_received(frame + b"EHLO example.org\r\n")
+        self.runner(0.5)
+        handler = self.protocol.event_handler
+        assert handler.called
+        written = b"".join(self.responses)
+        assert written.startswith(b"220 ")
+        assert b"250 " in written
+        # Nothing must remain buffered: the EHLO line was fully parsed.
+        assert bytes(self.protocol._reader._buffer) == b""
+
+    def test_smtp_trailing_bytes_fragmented_delivery(self, setup_proxy_protocol):
+        setup_proxy_protocol(
+            self, proxy_protocol_checksum_policy=CRC32CPolicy.OPTIONAL
+        )
+        frame = self._checksummed_frame()
+        stream = frame + b"MAIL FROM:<a@b>\r\n"
+        # Deliver the whole stream one byte at a time.
+        for octet in stream:
+            self.protocol.data_received(bytes([octet]))
+        self.runner(0.5)
+        assert self.protocol.event_handler.called
+        written = b"".join(self.responses)
+        assert written.startswith(b"220 ")
+        # The SMTP loop must have consumed the fragmented MAIL command intact.
+        # No EHLO was sent, so the server correctly rejects it with 503 rather
+        # than leaving any bytes stuck in the reader buffer.
+        assert b"503 " in written
+        assert bytes(self.protocol._reader._buffer) == b""
 
 
 @controller_data(proxy_protocol_timeout=0.3)

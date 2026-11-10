@@ -269,6 +269,16 @@ Enums
       If not an empty string, contains the error encountered when parsing
       the PROXY Protocol header.
 
+   .. py:attribute:: checksum_status
+      :type: CRC32CStatus
+
+      The outcome of the PROXYv2 ``CRC32C`` TLV Vector verification, kept
+      distinct from :attr:`error` so that "not provided", "verified" and
+      "verification failed" are all distinguishable. See :ref:`crc32c`.
+
+      Defaults to :attr:`CRC32CStatus.NOT_PROVIDED`; an absent checksum is
+      never reported as :attr:`CRC32CStatus.VALID`.
+
    |
    | :part:`Methods`
 
@@ -426,57 +436,130 @@ Enums
 
 .. _crc32c:
 
-Note on CRC32C Calculation
-==========================
+CRC32C Checksum Verification
+============================
 
-Neither the :class:`ProxyData` nor :class:`ProxyTLV` classes implement `PROXYv2 CRC32C validation`_;
-the main reason being that Python has no built-in module for calculating CRC32C.
-To perform CRC32C, third-party modules need to be installed,
-but we are uncomfortable doing that for the following reasons:
+The PROXYv2 specification defines an optional ``CRC32C`` TLV Vector
+(``PP2_TYPE_CRC32C = 0x03``) carrying a Castagnoli CRC32C checksum computed
+over the whole PROXY header, with the 4-octet checksum field itself zeroed out
+during calculation.
 
-* There are more than one third-party modules providing CRC32C,
-  e.g., ``crcmod``, ``crc32c``, ``google-crc32c``, etc.
-  Problem is, there is no known clear comparison between them,
-  so we cannot tell easily which one is 'best'.
-* Some of these third-party modules seem to be no longer being maintained.
-* Most of the available third-party modules are binary distribution.
-  This potentially causes problems with existing binaries/libraries,
-  not to mention possible (albeit unlikely) vector for malware.
-* We really don't like adding dependencies outside those that are really needed.
+``aiosmtpd`` ships a dependency-free, pure-Python CRC32C implementation
+(:func:`crc32c`) and can verify this TLV Vector automatically, according to a
+configurable policy. No third-party or binary package is required.
 
-In short, we have strong reasons to NOT implement PROXYv2 CRC32C validation,
-and we have plans to NEVER implement it.
+.. important::
 
-If you *absolutely* need PROXYv2 CRC32C validation,
-you should perform it yourself in the :meth:`handle_PROXY` hook.
-To assist you, we have provided the :attr:`~.ProxyData.whole_raw`, :attr:`~.ProxyData.tlv_start`, and :attr:`~.ProxyTLV.tlv_loc` attributes.
+   A CRC32C checksum can only detect **transport corruption** of the PROXY
+   header. It is *not* an authentication mechanism and provides no integrity
+   guarantee against a sender who can recompute the checksum.
 
-You should do the following:
+   Trust in the proxy itself must still be established independently through
+   your deployment/ingress configuration (for example, only accepting
+   connections from the proxy's addresses or a private network). In
+   particular, the presence of an ``SSL`` TLV Vector — even a checksum-valid
+   one — must never be interpreted as proof that the end user has
+   authenticated; those flags only describe the transport up to the proxy.
 
-0. Choose a CRC32C module of your liking, install that, and import it.
+.. class:: CRC32CPolicy
 
-1. Find the "CRC32C" TLV Vector in ``whole_raw``;
-   it would start at byte ``tlv_start + tlv_loc["CRC32C"]``
+   Selects how strictly the PROXYv2 ``CRC32C`` TLV Vector is verified.
+   Pass one of its members as the
+   :attr:`~aiosmtpd.smtp.SMTP.proxy_protocol_checksum_policy` parameter, or to
+   :func:`get_proxy` directly. The policy has no effect on PROXYv1 headers.
 
-2. Zero out the 4-octet Value part of the "CRC32C" TLV Vector
+   .. py:attribute:: IGNORE
+      :value: 0
 
-3. Perform CRC32C calculation over the modified ``whole_raw``
+      The default. Verification is never attempted and
+      :attr:`ProxyData.checksum_status` stays
+      :attr:`CRC32CStatus.NOT_PROVIDED`. The checksum TLV, if present, is still
+      parsed and exposed like any other TLV Vector.
 
-4. Convert the result to big-endian bytes,
-   and compare with the ``.CRC32C`` attribute of the ProxyTLV instance
+   .. py:attribute:: OPTIONAL
+      :value: 1
 
-Example::
+      If a ``CRC32C`` TLV Vector is present it is verified; a missing one is
+      accepted. A missing checksum is reported as
+      :attr:`CRC32CStatus.NOT_PROVIDED` — it is **never** reported as
+      :attr:`CRC32CStatus.VALID`. A present-but-wrong or malformed checksum
+      invalidates the header.
 
-    # The int(3) at end is to skip over the "T" and "L" part
-    offset = proxy_data.tlv_start + proxy_data.tlv.tlv_loc["CRC32C"] + 3
-    # Since whole_raw is a bytearray, we can do slice replacement
-    proxy_data.whole_raw[offset:offset + 4] = "\x00\x00\x00\x00"
-    # Actual syntax will depend on the module you use
-    calculated: int = crc32c(proxy_data.whole_raw)
-    # Adjust first part as necessary if calculated is not int
-    validated = calculated.to_bytes(4, "big") == proxy_data.tlv.CRC32C
+   .. py:attribute:: REQUIRED
+      :value: 2
 
-Good luck!
+      A present, correctly-sized and matching ``CRC32C`` TLV Vector is
+      mandatory. A missing, malformed or mismatching checksum invalidates the
+      header.
+
+.. class:: CRC32CStatus
+
+   The outcome of looking for and verifying the ``CRC32C`` TLV Vector. This is
+   deliberately separate from :attr:`ProxyData.error`: a header can parse
+   perfectly while its checksum is absent or wrong.
+
+   .. py:attribute:: NOT_PROVIDED
+      :value: 0
+
+      No verification was attempted (:attr:`CRC32CPolicy.IGNORE`, or a PROXYv1
+      header) or no ``CRC32C`` TLV Vector was present.
+
+   .. py:attribute:: VALID
+      :value: 1
+
+      A ``CRC32C`` TLV Vector was present and the recomputed checksum matched.
+
+   .. py:attribute:: INVALID
+      :value: 2
+
+      A ``CRC32C`` TLV Vector was present but unusable or mismatching — for
+      example a checksum mismatch, a duplicate ``CRC32C`` TLV Vector, a value
+      whose length is not exactly 4 octets, a TLV Vector whose declared length
+      runs past the end of the header, or a truncated TLV Vector.
+
+Verification details
+--------------------
+
+Only **top-level** TLV Vectors are walked when locating the checksum, so the
+offsets of subvectors nested inside an ``SSL`` TLV Vector never influence the
+checksum range: the checksum is always calculated over the whole header with
+only the 4-octet ``CRC32C`` value zeroed. :attr:`ProxyData.whole_raw` is never
+mutated; verification operates on a zeroed copy.
+
+SMTP bytes that arrive in the same TCP segment as the PROXY header are not part
+of the header and are never consumed by the preamble parser; they remain in the
+stream reader for the SMTP state machine.
+
+Under :attr:`CRC32CPolicy.REQUIRED` (and for any malformed/mismatching
+checksum under :attr:`CRC32CPolicy.OPTIONAL`), the failed preamble makes
+:attr:`ProxyData.valid` false. The SMTP connection is then rejected *before*
+the ``220`` greeting and before the ``handle_PROXY`` hook is invoked, so a
+failing preamble can never reach the SMTP command handler.
+
+.. function:: crc32c(data) -> int
+
+   :param data: The bytes (``bytes``, ``bytearray`` or ``memoryview``) to
+      calculate the checksum over
+   :return: The CRC32C (Castagnoli) checksum as an unsigned 32-bit integer
+
+   Pure-Python, table-driven CRC32C with no third-party dependency. The empty
+   input yields ``0`` and the ASCII string ``"123456789"`` yields the canonical
+   check value ``0xE3069283``.
+
+Manual verification
+-------------------
+
+If you prefer to perform verification yourself inside the ``handle_PROXY``
+hook instead of selecting a policy, all necessary bytes remain available.
+Note the 4-octet value starts *after* the 3-octet type+length header::
+
+    # tlv_loc points at the start (type octet) of the CRC32C TLV Vector;
+    # add 3 to skip the "T" and "L" parts and reach the value.
+    value_offset = proxy_data.tlv_start + proxy_data.tlv.tlv_loc["CRC32C"] + 3
+    checksum_input = bytearray(proxy_data.whole_raw)
+    checksum_input[value_offset:value_offset + 4] = b"\x00\x00\x00\x00"
+    validated = crc32c(checksum_input).to_bytes(4, "big") == proxy_data.tlv.CRC32C
+
 
 .. _`command`: https://github.com/haproxy/haproxy/blob/v2.3.0/doc/proxy-protocol.txt#L346-L358
 .. _`address family`: https://github.com/haproxy/haproxy/blob/v2.3.0/doc/proxy-protocol.txt#L366-L381

@@ -16,6 +16,17 @@ Fixed/Improved
   during verification, so authentication can succeed. The user database gained a
   ``salt`` column, so re-run ``make_user_db.py`` if you already have one.
   (Closes #475)
+* Added optional, dependency-free verification of the PROXYv2 ``CRC32C`` TLV
+  Vector. A new ``proxy_protocol_checksum_policy`` parameter (members of the new
+  ``CRC32CPolicy`` enum: ``IGNORE``, ``OPTIONAL``, ``REQUIRED``) controls the
+  behavior, and ``ProxyData.checksum_status`` (the new ``CRC32CStatus`` enum)
+  distinguishes "not provided", "valid" and "invalid" independently of the
+  parse error state. Duplicate or wrongly-sized checksum TLVs, TLVs whose length
+  exceeds the header, truncated TLVs and checksum mismatches are handled
+  explicitly, and a failed preamble never reaches the SMTP handler under a
+  verifying policy. CRC32C only detects transport corruption; trust in the
+  proxy and any client authentication must still be established independently
+  and cannot be inferred from TLV flags such as ``SSL``.
 
 
 1.4.6 (2024-05-18)

@@ -95,6 +95,137 @@ class UnknownTypeTLV(KeyError):
 
 
 @public
+class CRC32CStatus(IntEnum):
+    """
+    Outcome of looking for / verifying the PROXYv2 CRC32C TLV Vector.
+
+    This is intentionally distinct from :attr:`ProxyData.error`: a header can
+    parse perfectly while its checksum is absent or wrong, and a header can be
+    structurally malformed for reasons unrelated to its checksum.
+    """
+
+    NOT_PROVIDED = 0
+    """No CRC32C TLV Vector was present (or verification was not attempted)."""
+    VALID = 1
+    """A CRC32C TLV Vector was present and its checksum matched."""
+    INVALID = 2
+    """A CRC32C TLV Vector was present but unusable or mismatched."""
+
+
+@public
+class CRC32CPolicy(IntEnum):
+    """
+    How strictly the PROXYv2 CRC32C TLV Vector should be verified.
+    """
+
+    IGNORE = 0
+    """Never attempt verification; status stays :attr:`CRC32CStatus.NOT_PROVIDED`."""
+    OPTIONAL = 1
+    """Verify when present; absence is allowed and is never reported as valid."""
+    REQUIRED = 2
+    """A present and matching CRC32C TLV Vector is mandatory."""
+
+
+# CRC32C (Castagnoli, polynomial 0x1EDC6F41, reflected 0x82F63B78).
+# Pure-Python table-driven implementation; no third-party dependency required.
+
+
+def _build_crc32c_table() -> Tuple[int, ...]:
+    table = []
+    for index in range(256):
+        crc = index
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
+        table.append(crc)
+    return tuple(table)
+
+
+_CRC32C_TABLE = _build_crc32c_table()
+
+
+@public
+def crc32c(data: Union[bytes, bytearray, memoryview]) -> int:
+    """
+    Calculate the CRC32C (Castagnoli) checksum of ``data``.
+
+    :param data: The bytes to calculate the checksum over
+    :return: The CRC32C checksum as an unsigned 32-bit integer
+    """
+    crc = 0xFFFFFFFF
+    for octet in memoryview(data):
+        crc = _CRC32C_TABLE[(crc ^ octet) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+
+_CRC32C_TYPE = 0x03
+_CRC32C_VALUE_LEN = 4
+
+
+def _verify_v2_crc32c(proxy_data: "ProxyData", policy: CRC32CPolicy) -> None:
+    """
+    Verify the PROXYv2 CRC32C TLV Vector of an already-parsed header.
+
+    Only top-level TLV Vectors are walked, so the offsets of subvectors nested
+    inside an SSL TLV Vector never influence the checksum range: the checksum is
+    always computed over the whole header with only the 4-octet CRC32C value
+    zeroed out.
+    """
+    if policy is CRC32CPolicy.IGNORE or proxy_data.version != 2:
+        return
+
+    raw = proxy_data.whole_raw
+    # rest is always a suffix of whole_raw; deriving the start of the TLV area
+    # this way also covers the UNSPEC family (where tlv_start stays None).
+    tlv_offset = len(raw) - len(proxy_data.rest)
+
+    def fail(message: str) -> None:
+        proxy_data.checksum_status = CRC32CStatus.INVALID
+        proxy_data.with_error(message)
+
+    crc_value_offset = -1
+    index = tlv_offset
+    while index < len(raw):
+        if len(raw) - index < 3:
+            fail("PROXYv2 truncated TLV vector")
+            return
+        tlv_type = raw[index]
+        tlv_len = int.from_bytes(raw[index + 1 : index + 3], "big")
+        value_start = index + 3
+        value_end = value_start + tlv_len
+        if value_end > len(raw):
+            fail("PROXYv2 TLV vector length exceeds header")
+            return
+        if tlv_type == _CRC32C_TYPE:
+            if crc_value_offset >= 0:
+                fail("PROXYv2 duplicate CRC32C TLV vector")
+                return
+            if tlv_len != _CRC32C_VALUE_LEN:
+                fail("PROXYv2 CRC32C TLV vector has wrong length")
+                return
+            crc_value_offset = value_start
+        index = value_end
+
+    if crc_value_offset < 0:
+        proxy_data.checksum_status = CRC32CStatus.NOT_PROVIDED
+        if policy is CRC32CPolicy.REQUIRED:
+            proxy_data.with_error("PROXYv2 CRC32C TLV vector not provided")
+        return
+
+    # Zero out the checksum field on a copy; whole_raw must remain unmodified.
+    checksum_input = bytearray(raw)
+    checksum_input[crc_value_offset : crc_value_offset + _CRC32C_VALUE_LEN] = (
+        b"\x00" * _CRC32C_VALUE_LEN
+    )
+    expected = int.from_bytes(
+        raw[crc_value_offset : crc_value_offset + _CRC32C_VALUE_LEN], "big"
+    )
+    if crc32c(checksum_input) != expected:
+        fail("PROXYv2 CRC32C checksum mismatch")
+        return
+    proxy_data.checksum_status = CRC32CStatus.VALID
+
+
+@public
 class AsyncReader(Protocol):
     async def read(self, n: int = ...) -> bytes:
         ...
@@ -274,8 +405,9 @@ class ProxyData:
     whole_raw: bytearray = _anoinit(factory=bytearray)
     """
     The whole undecoded PROXY Header as-received. This can be used to (1) perform
-    troubleshooting, and/or (2) calculate CRC32C (which will NOT be implemented in
-    this module to reduce number of deps.
+    troubleshooting, and/or (2) independently recalculate the CRC32C checksum.
+    The built-in CRC32C verification (see :class:`CRC32CPolicy`) does not
+    mutate this attribute; it works on a zeroed copy instead.
     """
     tlv_start: int = _anoinit(default=None)
     """
@@ -284,6 +416,12 @@ class ProxyData:
     error: str = _anoinit(default="")
     """
     If not an empty string, contains the error encountered when parsing
+    """
+    checksum_status: CRC32CStatus = _anoinit(default=CRC32CStatus.NOT_PROVIDED)
+    """
+    Status of the PROXYv2 CRC32C TLV Vector verification. Absence of a checksum
+    is reported as :attr:`CRC32CStatus.NOT_PROVIDED`, never as
+    :attr:`CRC32CStatus.VALID`.
     """
     _tlv: Optional[ProxyTLV] = _anoinit(default=None)
 
@@ -424,18 +562,22 @@ async def _get_v1(reader: AsyncReader, initial: Union[bytes, bytearray, memoryvi
     return proxy_data
 
 
-async def _get_v2(reader: AsyncReader, initial: Union[bytes, bytearray, memoryview] = b"") -> ProxyData:
+async def _get_v2(
+    reader: AsyncReader,
+    initial: Union[bytes, bytearray, memoryview] = b"",
+    checksum_policy: CRC32CPolicy = CRC32CPolicy.IGNORE,
+) -> ProxyData:
     proxy_data = ProxyData(version=2)
     whole_raw = bytearray()
 
     async def read_rest(
         field_name: str, field_buf: bytearray, field_len: int
     ) -> Tuple[bytearray, bytearray]:
-        left = field_len - len(field_buf)
-        while left > 0:
-            piece = await reader.read(left)
-            left -= len(piece)
-            if not piece or left < 0:
+        # StreamReader.read(n) is allowed to return fewer than n bytes; loop
+        # until the field is complete instead of treating a short read as EOF.
+        while len(field_buf) < field_len:
+            piece = await reader.read(field_len - len(field_buf))
+            if not piece:
                 raise ConnectionError(f"Connection lost while waiting for {field_name}")
             field_buf += piece
         return field_buf[0:field_len], field_buf[field_len:]
@@ -478,6 +620,7 @@ async def _get_v2(reader: AsyncReader, initial: Union[bytes, bytearray, memoryvi
 
     if fam_proto not in V2_PARSE_ADDR_FAMPRO:
         proxy_data.rest = tail_part
+        _verify_v2_crc32c(proxy_data, checksum_policy)
         return proxy_data
 
     if proxy_data.family == AF.INET:
@@ -514,13 +657,19 @@ async def _get_v2(reader: AsyncReader, initial: Union[bytes, bytearray, memoryvi
     if tail_part:
         proxy_data.tlv_start = 16 + addr_len
 
+    _verify_v2_crc32c(proxy_data, checksum_policy)
     return proxy_data
 
 
 @public
-async def get_proxy(reader_func: AsyncReader) -> ProxyData:
+async def get_proxy(
+    reader_func: AsyncReader,
+    checksum_policy: CRC32CPolicy = CRC32CPolicy.IGNORE,
+) -> ProxyData:
     """
     :param reader_func: Async function that implements the AsyncReader protocol.
+    :param checksum_policy: How strictly to verify the PROXYv2 CRC32C TLV
+        Vector. Has no effect on PROXYv1 headers.
     :return: Proxy Data
     """
     log.debug("Waiting for PROXY signature")
@@ -531,7 +680,7 @@ async def get_proxy(reader_func: AsyncReader) -> ProxyData:
             return await _get_v1(reader_func, signature)
         elif signature == V2_SIGNATURE[0:5]:
             log.debug("PROXY version 2")
-            return await _get_v2(reader_func, signature)
+            return await _get_v2(reader_func, signature, checksum_policy)
         else:
             return ProxyData(version=None).with_error("PROXY unrecognized signature")
     except Exception as e:

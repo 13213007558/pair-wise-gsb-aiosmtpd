@@ -37,7 +37,11 @@ import attr
 from public import public
 
 from aiosmtpd import __version__, _get_or_new_eventloop
-from aiosmtpd.proxy_protocol import ProxyData, get_proxy
+from aiosmtpd.proxy_protocol import (
+    CRC32CPolicy,
+    ProxyData,
+    get_proxy,
+)
 
 
 # region #### Custom Data Types #######################################################
@@ -338,6 +342,7 @@ class SMTP(asyncio.StreamReaderProtocol):
             command_call_limit: Union[int, Dict[str, int], None] = None,
             authenticator: Optional[AuthenticatorType] = None,
             proxy_protocol_timeout: Optional[Union[int, float]] = None,
+            proxy_protocol_checksum_policy: Optional[CRC32CPolicy] = None,
             loop: Optional[asyncio.AbstractEventLoop] = None
     ):
         self.__ident__ = ident or __ident__
@@ -388,6 +393,14 @@ class SMTP(asyncio.StreamReaderProtocol):
             elif proxy_protocol_timeout < 3.0:
                 log.warning("proxy_protocol_timeout < 3.0")
         self._proxy_timeout = proxy_protocol_timeout
+
+        if proxy_protocol_checksum_policy is None:
+            proxy_protocol_checksum_policy = CRC32CPolicy.IGNORE
+        elif not isinstance(proxy_protocol_checksum_policy, CRC32CPolicy):
+            raise TypeError(
+                "proxy_protocol_checksum_policy must be a CRC32CPolicy member"
+            )
+        self._proxy_checksum_policy: CRC32CPolicy = proxy_protocol_checksum_policy
 
         self._authenticator: Optional[AuthenticatorType]
         self._auth_callback: Optional[AuthCallbackType]
@@ -625,7 +638,9 @@ class SMTP(asyncio.StreamReaderProtocol):
         if self._proxy_timeout is not None:
             self._reset_timeout(self._proxy_timeout)
             log.debug("%r waiting PROXY handshake", self.session.peer)
-            self.session.proxy_data = await get_proxy(self._reader)
+            self.session.proxy_data = await get_proxy(
+                self._reader, self._proxy_checksum_policy
+            )
             if self.session.proxy_data:
                 log.info("%r valid PROXY handshake", self.session.peer)
                 status = await self._call_handler_hook("PROXY", self.session.proxy_data)

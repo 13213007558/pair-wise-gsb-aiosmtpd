@@ -163,7 +163,7 @@ aiosmtpd.smtp
    require_starttls=False, timeout=300, auth_required=False, \
    auth_require_tls=True, auth_exclude_mechanism=None, auth_callback=None, \
    authenticator=None, command_call_limit=None, \
-   proxy_protocol_timeout=None, \
+   proxy_protocol_timeout=None, proxy_protocol_checksum_policy=None, \
    loop=None)
 
    |
@@ -370,6 +370,22 @@ aiosmtpd.smtp
          This is in accordance to the PROXY Protocol standard.
 
       .. versionadded:: 1.4
+
+   .. py:attribute:: proxy_protocol_checksum_policy
+      :type: Optional[CRC32CPolicy]
+      :value: None
+
+      Selects how strictly the PROXYv2 ``CRC32C`` TLV Vector is verified.
+      ``None`` (the default) is equivalent to :attr:`CRC32CPolicy.IGNORE`.
+
+      See the `PROXY Protocol Support documentation <ProxyProtocol>`_ and
+      :ref:`crc32c` for the meaning of each :class:`CRC32CPolicy` member and
+      the resulting :class:`CRC32CStatus`. A failed preamble under a verifying
+      policy closes the connection before the SMTP greeting is sent.
+
+      A :class:`TypeError` is raised if the value is neither ``None`` nor a
+      :class:`CRC32CPolicy` member. Has no effect when
+      :attr:`proxy_protocol_timeout` is not set.
 
    .. py:attribute:: loop
       :noindex:
