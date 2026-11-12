@@ -158,6 +158,9 @@ class SMTP_STATUS_CODES:
     S503_MAIL_NEEDED = StatusCode(503, b"Error: need MAIL command")
     S503_MAIL_NESTED = StatusCode(503, b"Error: nested MAIL command")
     S503_RCPT_NEEDED = StatusCode(503, b"Error: need RCPT command")
+    S503_STARTTLS_ACTIVE = StatusCode(
+        503, b"TLS already active; duplicate STARTTLS not allowed"
+    )
 
     S504_AUTH_UNRECOG = StatusCode(504, b"5.5.4 Unrecognized authentication type")
     S530_STARTTLS_FIRST = StatusCode(530, b"Must issue a STARTTLS command first")

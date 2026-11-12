@@ -917,6 +917,12 @@ class SMTP(asyncio.StreamReaderProtocol):
         if not self.tls_context:
             await self.push('454 TLS not available')
             return
+        if self._tls_protocol is not None:
+            # RFC 3207 part 4: a server MUST NOT start another TLS handshake
+            # on an already encrypted connection.
+            await self.push(
+                '503 TLS already active; duplicate STARTTLS not allowed')
+            return
         await self.push('220 Ready to start TLS')
         # Create a waiter Future to wait for SSL handshake to complete
         waiter = self.loop.create_future()
