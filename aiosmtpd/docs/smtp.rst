@@ -149,6 +149,22 @@ aiosmtpd.smtp
 
    For more info, please see :class:`AuthResult`
 
+.. class:: AuthInteractStatus
+
+   Enumerates the outcome of a single :meth:`SMTP.auth_challenge` round-trip:
+
+   * ``OK`` — the client sent decodable Base64 data;
+   * ``CANCELLED`` — the client aborted with a single ``*``;
+   * ``BAD_RESPONSE`` — the client data could not be Base64-decoded;
+   * ``CONNECTION_LOST`` — the connection closed while waiting for a response.
+
+.. class:: AuthInteractResult(status, response=None)
+
+   Outcome of a single :meth:`SMTP.auth_challenge` round-trip.
+   ``response`` holds the decoded client bytes only when
+   ``status == AuthInteractStatus.OK`` and is ``None`` otherwise;
+   the ``success`` property is ``True`` only for an ``OK`` status.
+
 .. class:: LoginPassword(login: bytes, password: bytes)
 
    A subclass of :class:`typing.NamedTuple` that holds the Authentication Data for the
@@ -509,6 +525,32 @@ aiosmtpd.smtp
       ``_auth_methods`` dictionary and call the corresponding
       ``auth_<mechanism>`` hook.
 
+   .. py:method:: auth_challenge(\
+      challenge, encode_to_b64=True, log_client_response=False\
+      ) -> AuthInteractResult
+      :async:
+
+      :param challenge: The SMTP AUTH challenge to send to the client.
+         May be in plaintext, may be in base64. Do NOT prefix with "334 "!
+      :type challenge: AnyStr
+      :param encode_to_b64: If true, will perform base64-encoding before sending
+         the challenge to the client.
+      :type encode_to_b64: bool
+      :param log_client_response: If true, will perform logging of client response
+      :type log_client_response: bool
+      :return: An :class:`AuthInteractResult` describing the round-trip outcome.
+
+      The :attr:`AuthInteractResult.status` distinguishes the four possible
+      outcomes — successful response, client abort (``*``), malformed Base64,
+      and mid-exchange connection loss — see :class:`AuthInteractStatus`.
+      The decoded response is present only for a successful round.
+
+      .. warning::
+
+         Setting ``log_client_response=True`` might cause leakage of sensitive information!
+
+         :boldital:`DO NOT TURN ON` UNLESS ABSOLUTELY NECESSARY!
+
    .. py:method:: challenge_auth(\
       challenge, encode_to_b64=True, log_client_response=False\
       ) -> Union[_Missing, bytes]
@@ -524,10 +566,13 @@ aiosmtpd.smtp
       :type log_client_response: bool
       :return: Response from client (already base64-decoded) or ``MISSING`` (see description)
 
-      This method will return ``MISSING`` if either of these scenarios happen:
+      This method will return ``MISSING`` if any of these scenarios happen:
 
          * client aborted the ``AUTH`` procedure by sending ``b"*"``, or
-         * client response to the challenge cannot be base64-decoded.
+         * client response to the challenge cannot be base64-decoded, or
+         * the connection was lost while waiting for the response.
+
+      Use :meth:`auth_challenge` instead when those scenarios must be told apart.
 
       .. warning::
 

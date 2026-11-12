@@ -108,6 +108,55 @@ the methods of the handler instance will override the built-in methods.
    The AUTH Mechanism Hook MUST return an instance of :class:`AuthResult`
    containing the result of the Authentication process.
 
+Multi-round Mechanisms
+~~~~~~~~~~~~~~~~~~~~~~
+
+A mechanism can issue any number of challenge/response rounds with
+:meth:`~aiosmtpd.smtp.SMTP.auth_challenge`.
+Each round returns an :class:`AuthInteractResult` whose
+:attr:`~AuthInteractResult.status` attribute tells the four possible outcomes
+apart, so a mechanism always knows *why* an exchange ended:
+
+.. autoclass:: AuthInteractStatus
+   :members:
+   :undoc-members:
+
+.. autoclass:: AuthInteractResult
+   :members:
+
+Only :attr:`AuthInteractStatus.OK` carries a decoded
+:attr:`~AuthInteractResult.response`;
+for every other outcome the response is ``None``
+so that aborted or malformed rounds never retain half-read credentials.
+A mechanism MUST end the authentication (returning a failed :class:`AuthResult`)
+as soon as a round does not succeed.
+
+The legacy :meth:`~aiosmtpd.smtp.SMTP.challenge_auth` method keeps its original
+contract: it returns the decoded response bytes, or :data:`~aiosmtpd.smtp.MISSING`
+for cancellation, malformed Base64 and connection loss alike.
+Use :meth:`~aiosmtpd.smtp.SMTP.auth_challenge` in new mechanisms when those
+outcomes must be distinguished.
+
+Lifecycle Guarantees
+~~~~~~~~~~~~~~~~~~~~
+
+The framework guarantees that, once an AUTH command is accepted:
+
+* The TLS requirement is evaluated *before* the mechanism starts; a mechanism
+  never runs on a connection that fails the
+  :attr:`~aiosmtpd.smtp.SMTP.auth_require_tls` check, and such a connection is
+  not offered any AUTH mechanism in the EHLO capability list either.
+* A client abort (``*``), a malformed Base64 response, or a mid-exchange
+  disconnect ends the current authentication immediately.
+  No ``authenticated`` flag and no partial ``auth_data`` survives a failed
+  attempt; the next ``EHLO``, ``NOOP`` or ``AUTH`` is interpreted as an ordinary
+  command.
+* If a mechanism raises, the exception is reported through
+  :meth:`~aiosmtpd.smtp.SMTP.handle_exception`, the exchange is torn down, and
+  subsequent commands are never consumed as challenge responses.
+* Failure diagnostics never include the raw challenge response, which may
+  contain encoded credentials.
+
 .. important::
 
    Defining *additional* AUTH hooks in your handler

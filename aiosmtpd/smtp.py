@@ -5,6 +5,7 @@ import asyncio
 import asyncio.sslproto as sslproto
 import binascii
 import collections
+import dataclasses
 import enum
 import inspect
 import logging
@@ -109,6 +110,47 @@ CLIENT_AUTH_B = re.compile(
 """Regex that matches 'AUTH <mech> <param>' commend"""
 
 # endregion
+
+
+@public
+class AuthInteractStatus(enum.Enum):
+    """
+    Outcome of a single AUTH challenge round-trip
+    (see :meth:`SMTP.auth_challenge`).
+    """
+
+    OK = enum.auto()
+    """Client answered the challenge with decodable Base64 data."""
+
+    CANCELLED = enum.auto()
+    """Client aborted the authentication by sending a single ``*``."""
+
+    BAD_RESPONSE = enum.auto()
+    """Client sent data that cannot be decoded as Base64."""
+
+    CONNECTION_LOST = enum.auto()
+    """Connection was closed (or otherwise failed) while waiting for a response."""
+
+
+@public
+@dataclasses.dataclass(frozen=True)
+class AuthInteractResult:
+    """
+    Describes the outcome of a single AUTH challenge round-trip.
+
+    Instances are returned by :meth:`SMTP.auth_challenge`.
+    The :attr:`response` attribute contains the decoded client response only
+    when :attr:`status` is :attr:`AuthInteractStatus.OK`; in every other case
+    it is ``None`` so that no (possibly sensitive) half-read data is retained.
+    """
+
+    status: AuthInteractStatus
+    response: Optional[bytes] = None
+
+    @property
+    def success(self) -> bool:
+        """True when the client provided a decodable response."""
+        return self.status is AuthInteractStatus.OK
 
 
 @attr.s
@@ -376,6 +418,10 @@ class SMTP(asyncio.StreamReaderProtocol):
         self.envelope: Optional[Envelope] = None
         self.transport: Optional[asyncio.BaseTransport] = None
         self._handler_coroutine: Optional[asyncio.Task[None]] = None
+        # True while an AUTH mechanism is exchanging challenges with the client.
+        # Ensures a failed/aborted AUTH never leaves the command loop reading
+        # subsequent commands as credentials of the aborted exchange.
+        self._auth_in_progress: bool = False
         if not auth_require_tls and auth_required:
             warn("Requiring AUTH while not requiring TLS "
                  "can lead to security vulnerabilities!")
@@ -655,6 +701,13 @@ class SMTP(asyncio.StreamReaderProtocol):
             try:
                 try:
                     line: bytes = await self._reader.readuntil()
+                except asyncio.IncompleteReadError:
+                    # Peer closed the connection (EOF) mid-command, possibly
+                    # while an AUTH mechanism was parked on a challenge. Stop
+                    # the command loop instead of spinning on the permanent
+                    # EOF; connection_lost() performs the remaining cleanup.
+                    log.info('%r EOF during _handle_client()', self.session.peer)
+                    return
                 except asyncio.LimitOverrunError as error:
                     # Line too long. Read until end of line before sending 500.
                     await self._reader.read(error.consumed)
@@ -947,6 +1000,17 @@ class SMTP(asyncio.StreamReaderProtocol):
         except Exception as error:
             raise TLSSetupException() from error
 
+    def _reset_auth_state(self) -> None:
+        """
+        Clear any authentication state left by a finished AUTH attempt, so a
+        failed/aborted attempt never looks like a successful one and the next
+        EHLO/NOOP/AUTH is interpreted as an ordinary command.
+        """
+        assert self.session is not None
+        self.session.authenticated = None
+        self.session.auth_data = None
+        self._auth_in_progress = False
+
     @syntax("AUTH <mechanism>")
     async def smtp_AUTH(self, arg: str) -> None:
         if await self.check_helo_needed("EHLO"):
@@ -976,54 +1040,150 @@ class SMTP(asyncio.StreamReaderProtocol):
             await self.push('504 5.5.4 Unrecognized authentication type')
             return
 
+        # Do not carry over state from any previous (failed) AUTH attempt.
+        self._reset_auth_state()
+        self._auth_in_progress = True
+
         CODE_SUCCESS = "235 2.7.0 Authentication successful"
         CODE_INVALID = "535 5.7.8 Authentication credentials invalid"
-        status = await self._call_handler_hook('AUTH', args)
-        if status is MISSING:
-            auth_method = self._auth_methods[mechanism]
-            log.debug(
-                "Using %s auth_ hook for %r",
-                "builtin" if auth_method.is_builtin else "handler",
-                mechanism
-            )
-            # Pass 'self' to method so external methods can leverage this
-            # class's helper methods such as push()
-            auth_result = await auth_method.method(self, args)
-            log.debug("auth_%s returned %r", mechanism, auth_result)
+        try:
+            status = await self._call_handler_hook('AUTH', args)
+            if status is MISSING:
+                auth_method = self._auth_methods[mechanism]
+                log.debug(
+                    "Using %s auth_ hook for %r",
+                    "builtin" if auth_method.is_builtin else "handler",
+                    mechanism
+                )
+                # Pass 'self' to method so external methods can leverage this
+                # class's helper methods such as push()
+                auth_result = await auth_method.method(self, args)
+                log.debug("auth_%s returned %r", mechanism, auth_result)
 
-            # New system using `authenticator` and AuthResult
-            if isinstance(auth_result, AuthResult):
-                if auth_result.success:
-                    self.session.authenticated = True
-                    _auth_data = auth_result.auth_data
-                    self.session.auth_data = _auth_data
-                    # Custom mechanisms might not implement the "login" attribute, and
-                    # that's okay.
-                    self.session.login_data = getattr(_auth_data, "login", None)
-                    status = auth_result.message or CODE_SUCCESS
-                else:
-                    if auth_result.handled:
-                        status = None
-                    elif auth_result.message:
-                        status = auth_result.message
+                # New system using `authenticator` and AuthResult
+                if isinstance(auth_result, AuthResult):
+                    if auth_result.success:
+                        self.session.authenticated = True
+                        _auth_data = auth_result.auth_data
+                        self.session.auth_data = _auth_data
+                        # Custom mechanisms might not implement the "login" attribute, and
+                        # that's okay.
+                        self.session.login_data = getattr(_auth_data, "login", None)
+                        status = auth_result.message or CODE_SUCCESS
                     else:
-                        status = CODE_INVALID
+                        if auth_result.handled:
+                            status = None
+                        elif auth_result.message:
+                            status = auth_result.message
+                        else:
+                            status = CODE_INVALID
 
-            # Old system using `auth_callback` and _TriState
-            elif auth_result is None:
-                # None means there's an error already handled by method and
-                # we don't need to do anything more
-                status = None
-            elif auth_result is MISSING or auth_result is False:
-                # MISSING means no error in AUTH process, but credentials
-                # is rejected / not valid
-                status = CODE_INVALID
-            else:
-                self.session.login_data = auth_result
-                status = CODE_SUCCESS
+                # Old system using `auth_callback` and _TriState
+                elif auth_result is None:
+                    # None means there's an error already handled by method and
+                    # we don't need to do anything more
+                    status = None
+                elif auth_result is MISSING or auth_result is False:
+                    # MISSING means no error in AUTH process, but credentials
+                    # is rejected / not valid
+                    status = CODE_INVALID
+                else:
+                    self.session.login_data = auth_result
+                    status = CODE_SUCCESS
+        except Exception as error:
+            # A mechanism blowing up mid-exchange must not strand the session
+            # inside an AUTH exchange, nor let later commands be consumed as
+            # challenge responses. Report the failure and start clean again.
+            self._reset_auth_state()
+            try:
+                status = await self.handle_exception(error)
+            except Exception as inner_error:
+                log.exception('%r Exception in handle_exception()',
+                              self.session.peer)
+                status = '500 Error: ({}) {}'.format(
+                    inner_error.__class__.__name__, str(inner_error))
+        finally:
+            self._auth_in_progress = False
 
+        if not self.session.authenticated:
+            # Unsuccessful, aborted or errored: make sure no half-finished
+            # auth_data/authenticated flag survives the attempt.
+            self.session.auth_data = None
         if status is not None:  # pragma: no branch
             await self.push(status)
+
+    async def auth_challenge(
+        self,
+        challenge: Union[str, bytes],
+        encode_to_b64: bool = True,
+        log_client_response: bool = False,
+    ) -> AuthInteractResult:
+        """
+        Send a challenge during authentication and return a structured
+        :class:`AuthInteractResult` describing what the client did.
+
+        "334 " will be prefixed, so do NOT put "334 " at start of
+        ``challenge``.
+
+        :param challenge: Challenge to send to client. If str, will be utf8-
+            encoded.
+        :param encode_to_b64: If true, then perform Base64 encoding on challenge
+        :param log_client_response: Perform logging of client's response.
+            WARNING: Might cause leak of sensitive information! Do not turn on
+            unless _absolutely_ necessary!
+        :return: Outcome of the challenge round-trip. The decoded response is
+            only available when :attr:`AuthInteractResult.success` is true;
+            cancellation, malformed Base64 and connection loss are reported via
+            distinct :class:`AuthInteractStatus` values and never leave
+            (possibly sensitive) response data behind.
+        """
+        challenge = (
+            challenge.encode() if isinstance(challenge, str) else challenge
+        )
+        assert isinstance(challenge, bytes)
+        # Trailing space is MANDATORY even if challenge is empty.
+        # See:
+        #   - https://tools.ietf.org/html/rfc4954#page-4 ¶ 5
+        #   - https://tools.ietf.org/html/rfc4954#page-13 "continue-req"
+        challenge = b"334 " + (b64encode(challenge) if encode_to_b64 else challenge)
+        assert self.session is not None
+        log.debug("%r << challenge: %r", self.session.peer, challenge)
+        await self.push(challenge)
+        try:
+            line = await self._reader.readline()
+        except (ConnectionResetError, asyncio.IncompleteReadError):
+            log.warning(
+                "%r connection lost during AUTH challenge", self.session.peer
+            )
+            return AuthInteractResult(AuthInteractStatus.CONNECTION_LOST)
+        if not line:
+            # StreamReader.readline() returns b"" at EOF; do not treat that as
+            # an (empty, decodable) response.
+            log.warning(
+                "%r connection lost during AUTH challenge", self.session.peer
+            )
+            return AuthInteractResult(AuthInteractStatus.CONNECTION_LOST)
+        if log_client_response:
+            warn("AUTH interaction logging is enabled!")
+            warn("Sensitive information might be leaked!")
+            log.debug("%r >> %r", self.session.peer, line)
+        blob: bytes = line.strip()
+        # '*' handling in accordance with RFC4954
+        if blob == b"*":
+            log.warning("%r aborted AUTH with '*'", self.session.peer)
+            await self.push("501 5.7.0 Auth aborted")
+            return AuthInteractResult(AuthInteractStatus.CANCELLED)
+        try:
+            decoded_blob = b64decode(blob, validate=True)
+        except binascii.Error:
+            # Never log the raw blob: it may contain encoded credentials.
+            log.debug(
+                "%r sent undecodable Base64 response (%d bytes)",
+                self.session.peer, len(blob),
+            )
+            await self.push("501 5.5.2 Can't decode base64")
+            return AuthInteractResult(AuthInteractStatus.BAD_RESPONSE)
+        return AuthInteractResult(AuthInteractStatus.OK, decoded_blob)
 
     async def challenge_auth(
         self,
@@ -1040,38 +1200,20 @@ class SMTP(asyncio.StreamReaderProtocol):
         :param log_client_response: Perform logging of client's response.
             WARNING: Might cause leak of sensitive information! Do not turn on
             unless _absolutely_ necessary!
-        :return: Response from client, or MISSING
+        :return: Decoded response from client, or MISSING when the client
+            aborted the exchange, sent malformed Base64, or the connection was
+            lost. Use :meth:`auth_challenge` when those outcomes must be told
+            apart.
         """
-        challenge = (
-            challenge.encode() if isinstance(challenge, str) else challenge
+        result = await self.auth_challenge(
+            challenge,
+            encode_to_b64=encode_to_b64,
+            log_client_response=log_client_response,
         )
-        assert isinstance(challenge, bytes)
-        # Trailing space is MANDATORY even if challenge is empty.
-        # See:
-        #   - https://tools.ietf.org/html/rfc4954#page-4 ¶ 5
-        #   - https://tools.ietf.org/html/rfc4954#page-13 "continue-req"
-        challenge = b"334 " + (b64encode(challenge) if encode_to_b64 else challenge)
-        assert self.session is not None
-        log.debug("%r << challenge: %r", self.session.peer, challenge)
-        await self.push(challenge)
-        line = await self._reader.readline()      # pytype: disable=attribute-error
-        if log_client_response:
-            warn("AUTH interaction logging is enabled!")
-            warn("Sensitive information might be leaked!")
-            log.debug("%r >> %r", self.session.peer, line)
-        blob: bytes = line.strip()
-        # '*' handling in accordance with RFC4954
-        if blob == b"*":
-            log.warning("%r aborted AUTH with '*'", self.session.peer)
-            await self.push("501 5.7.0 Auth aborted")
-            return MISSING
-        try:
-            decoded_blob = b64decode(blob, validate=True)
-        except binascii.Error:
-            log.debug("%r can't decode base64: %s", self.session.peer, blob)
-            await self.push("501 5.5.2 Can't decode base64")
-            return MISSING
-        return decoded_blob
+        if result.success:
+            assert result.response is not None
+            return result.response
+        return MISSING
 
     _334_PREFIX = re.compile(r"^334 ")
 

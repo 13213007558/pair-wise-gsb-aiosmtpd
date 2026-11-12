@@ -12,6 +12,19 @@ Fixed/Improved
 
 * Dropped Python 3.8, PyPy 3.8
 * Added PyPy 3.11, dropped PyPy 3.9
+* Custom multi-round AUTH mechanisms get a clearer interaction lifecycle:
+  the new ``SMTP.auth_challenge()`` returns an ``AuthInteractResult`` with an
+  ``AuthInteractStatus`` that distinguishes a successful response, a client
+  abort (``*``), malformed Base64, and a mid-exchange disconnect. The legacy
+  ``challenge_auth()`` keeps its existing ``bytes``/``MISSING`` contract.
+* A failed, aborted or errored AUTH attempt no longer leaves the session
+  authenticated or with partial ``auth_data``; the next EHLO/NOOP/AUTH is
+  handled as an ordinary command, and an exception inside a mechanism no longer
+  causes later commands to be read as challenge responses.
+* Malformed Base64 diagnostics no longer record the raw challenge response,
+  preventing credential leakage into logs.
+* The command loop stops cleanly on EOF instead of spinning when a connection
+  is closed while a mechanism is waiting for a challenge.
 * The ``authenticated_relayer`` example now stores a per-user salt and uses it
   during verification, so authentication can succeed. The user database gained a
   ``salt`` column, so re-run ``make_user_db.py`` if you already have one.
